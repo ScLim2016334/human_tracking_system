@@ -2,9 +2,6 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import face_recognition # For face recognition and re-identification
-import pyttsx3 # For text-to-speech
-import time
-import threading
 
 # --- MediaPipe Initialization ---
 mp_pose = mp.solutions.pose
@@ -25,57 +22,14 @@ MASTER_HISTORY_THRESHOLD = 5 # At least 5 consecutive frames of calibration acti
 MASTER_FACE_RECORDED = False # Whether master face has been recorded
 MASTER_SKELETON_RECORDED = False # Whether master skeleton has been recorded
 
-# New occlusion handling related (IoU-based)
-OCCLUSION_IOU_THRESHOLD = 0.3 # IoU threshold to detect occlusion
-OCCLUSION_STOP_TIME = 3 # Time in seconds to ask master to stop
-OCCLUSION_DETECTION_FRAMES = 5 # Number of consecutive frames to confirm occlusion
-occlusion_detection_buffer = [] # Buffer to store recent occlusion detection results
-is_in_occlusion_mode = False # Whether currently in occlusion handling mode
-occlusion_start_time = None # When occlusion mode started
-last_announcement_time = 0 # To prevent too frequent announcements
-ANNOUNCEMENT_COOLDOWN = 2 # Minimum seconds between announcements
+# Occlusion handling related
+MASTER_LAST_KNOWN_POSITION = None # Last known position of master before occlusion
+MASTER_OCCLUSION_FRAMES = 0 # Number of frames master has been occluded
+MAX_OCCLUSION_FRAMES = 30 # Maximum frames to wait before considering master lost
+OCCLUSION_DISTANCE_THRESHOLD = 150 # Distance threshold to detect potential occlusion (pixels)
 
 # Face recognition related
 FACE_RECOGNITION_TOLERANCE = 0.4 # Face recognition tolerance, smaller value = stricter (0.6 is common default)
-
-# Text-to-speech engine
-tts_engine = None
-def init_tts():
-    """Initialize text-to-speech engine"""
-    global tts_engine
-    try:
-        tts_engine = pyttsx3.init()
-        tts_engine.setProperty('rate', 150)  # Speed of speech
-        tts_engine.setProperty('volume', 0.9)  # Volume level
-        print("Text-to-speech engine initialized successfully")
-    except Exception as e:
-        print(f"Failed to initialize text-to-speech engine: {e}")
-        tts_engine = None
-
-def announce_message(message):
-    """Announce message using text-to-speech"""
-    global last_announcement_time
-    current_time = time.time()
-    
-    # Prevent too frequent announcements
-    if current_time - last_announcement_time < ANNOUNCEMENT_COOLDOWN:
-        return
-    
-    last_announcement_time = current_time
-    print(f"ANNOUNCEMENT: {message}")
-    
-    if tts_engine:
-        try:
-            # Run TTS in a separate thread to avoid blocking
-            def speak():
-                tts_engine.say(message)
-                tts_engine.runAndWait()
-            
-            thread = threading.Thread(target=speak)
-            thread.daemon = True
-            thread.start()
-        except Exception as e:
-            print(f"Failed to announce message: {e}")
 
 # --- Helper Functions ---
 
@@ -130,13 +84,38 @@ def update_skeleton_ids(current_skeletons_data, frame_idx, image_width, image_he
         
         # If match successful and this ID hasn't been matched by other skeletons in this frame
         if best_match_id != -1 and best_match_id not in new_tracked_skeletons:
-            new_tracked_skeletons[best_match_id] = {
-                'last_pose': pose_results,
-                'bbox': current_bbox,
-                'last_seen_frame': frame_idx,
-                'is_master': tracked_skeletons[best_match_id]['is_master'],
-            }
-            matched_current_indices.add(current_idx)
+            # Special handling for master ID to prevent occlusion issues
+            if best_match_id == MASTER_ID:
+                # Check if this is likely the real master or an occluder
+                if MASTER_LAST_KNOWN_POSITION is not None:
+                    distance_to_last_known = np.linalg.norm(current_center - np.array(MASTER_LAST_KNOWN_POSITION))
+                    if distance_to_last_known > OCCLUSION_DISTANCE_THRESHOLD:
+                        # This skeleton is too far from master's last known position
+                        # Likely an occluder, assign new ID instead
+                        print(f"Potential occluder detected! Distance from master's last position: {distance_to_last_known:.1f}px")
+                        best_match_id = -1
+                    else:
+                        # This skeleton is close to master's last known position, likely the real master
+                        print(f"Master reappeared! Distance from last position: {distance_to_last_known:.1f}px")
+            
+            if best_match_id != -1:
+                new_tracked_skeletons[best_match_id] = {
+                    'last_pose': pose_results,
+                    'bbox': current_bbox,
+                    'last_seen_frame': frame_idx,
+                    'is_master': tracked_skeletons[best_match_id]['is_master'],
+                }
+                matched_current_indices.add(current_idx)
+            else:
+                # Assign new ID for potential occluder
+                new_tracked_skeletons[next_id] = {
+                    'last_pose': pose_results,
+                    'bbox': current_bbox,
+                    'last_seen_frame': frame_idx,
+                    'is_master': False, # New skeleton is not master by default
+                }
+                next_id += 1
+                matched_current_indices.add(current_idx)
         else:
             # No match, assign new ID
             new_tracked_skeletons[next_id] = {
@@ -280,52 +259,59 @@ def recognize_master_face(face_encodings):
     
     return is_master, best_distance
 
-def detect_occlusion_by_iou(current_skeletons_data, frame_idx, image_width, image_height):
+def detect_occlusion(current_skeletons_data, frame_idx, image_width, image_height):
     """
-    Detect occlusion using IoU between master and other skeletons.
+    Detect potential occlusion of master by other people.
     Returns True if occlusion is detected, False otherwise.
     """
-    global occlusion_detection_buffer, is_in_occlusion_mode, occlusion_start_time, MASTER_ID
+    global MASTER_LAST_KNOWN_POSITION, MASTER_OCCLUSION_FRAMES, MASTER_ID
     
-    if MASTER_ID == -1 or MASTER_ID not in tracked_skeletons:
+    if MASTER_ID == -1 or MASTER_LAST_KNOWN_POSITION is None:
         return False
     
-    # Get master skeleton bbox
-    master_bbox = tracked_skeletons[MASTER_ID]['bbox']
+    # Check if master is currently tracked
+    master_currently_tracked = False
+    master_current_position = None
     
-    # Check IoU with all other skeletons in current frame
-    max_iou = 0
-    for landmarks, pose_results in current_skeletons_data:
-        current_bbox = get_bbox_from_landmarks(landmarks, image_width, image_height)
-        iou = calculate_iou(master_bbox, current_bbox)
-        max_iou = max(max_iou, iou)
+    for s_id, s_data in tracked_skeletons.items():
+        if s_id == MASTER_ID and s_data['is_master']:
+            master_currently_tracked = True
+            master_current_position = [s_data['bbox'][0] + s_data['bbox'][2] // 2, 
+                                     s_data['bbox'][1] + s_data['bbox'][3] // 2]
+            break
     
-    # Update occlusion detection buffer
-    occlusion_detected = max_iou > OCCLUSION_IOU_THRESHOLD
-    occlusion_detection_buffer.append(occlusion_detected)
-    
-    # Keep only recent frames
-    if len(occlusion_detection_buffer) > OCCLUSION_DETECTION_FRAMES:
-        occlusion_detection_buffer.pop(0)
-    
-    # Confirm occlusion if detected in consecutive frames
-    if len(occlusion_detection_buffer) == OCCLUSION_DETECTION_FRAMES and all(occlusion_detection_buffer):
-        if not is_in_occlusion_mode:
-            is_in_occlusion_mode = True
-            occlusion_start_time = time.time()
-            announce_message(f"Master please stop for {OCCLUSION_STOP_TIME} seconds")
-            print(f"Occlusion detected! IoU: {max_iou:.3f}, asking master to stop for {OCCLUSION_STOP_TIME} seconds")
-        return True
-    
-    return False
+    if master_currently_tracked:
+        # Master is tracked, update last known position and reset occlusion counter
+        MASTER_LAST_KNOWN_POSITION = master_current_position
+        MASTER_OCCLUSION_FRAMES = 0
+        return False
+    else:
+        # Master not tracked, check for potential occlusion
+        MASTER_OCCLUSION_FRAMES += 1
+        
+        # Check if any new skeleton is very close to master's last known position
+        for landmarks, pose_results in current_skeletons_data:
+            current_center = np.mean([[lm.x, lm.y] for lm in landmarks.landmark], axis=0) * np.array([image_width, image_height])
+            distance_to_master = np.linalg.norm(current_center - np.array(MASTER_LAST_KNOWN_POSITION))
+            
+            if distance_to_master < OCCLUSION_DISTANCE_THRESHOLD:
+                # Potential occlusion detected
+                print(f"Potential occlusion detected! Distance to master: {distance_to_master:.1f}px")
+                return True
+        
+        # If master has been missing for too long, consider it lost
+        if MASTER_OCCLUSION_FRAMES > MAX_OCCLUSION_FRAMES:
+            print(f"Master lost after {MASTER_OCCLUSION_FRAMES} frames of occlusion")
+            MASTER_LAST_KNOWN_POSITION = None
+            MASTER_OCCLUSION_FRAMES = 0
+            return False
+        
+        return False
 
 # --- Main Program Logic ---
 def main():
     global MASTER_ID, MASTER_FACE_ENCODINGS, MASTER_POSE_BUFFER, next_id, tracked_skeletons, FACE_RECOGNITION_TOLERANCE
-    global MASTER_FACE_RECORDED, MASTER_SKELETON_RECORDED, is_in_occlusion_mode, occlusion_start_time
-
-    # Initialize text-to-speech engine
-    init_tts()
+    global MASTER_FACE_RECORDED, MASTER_SKELETON_RECORDED, MASTER_LAST_KNOWN_POSITION, MASTER_OCCLUSION_FRAMES
 
     cap = cv2.VideoCapture(0) # 0 represents default camera
     if not cap.isOpened():
@@ -376,114 +362,10 @@ def main():
             # --- 1. Update skeleton IDs (core tracking logic) ---
             update_skeleton_ids(current_skeletons_in_frame_data, frame_count, image_width, image_height)
             
-            # --- 2. Occlusion detection and recovery (only in normal tracking mode) ---
+            # --- 2. Occlusion detection (only in normal tracking mode) ---
             occlusion_detected = False
             if MASTER_SKELETON_RECORDED and MASTER_ID != -1:
-                occlusion_detected = detect_occlusion_by_iou(current_skeletons_in_frame_data, frame_count, image_width, image_height)
-                
-                # Handle occlusion recovery
-                if is_in_occlusion_mode:
-                    # Check if occlusion period is over
-                    current_time = time.time()
-                    if current_time - occlusion_start_time >= OCCLUSION_STOP_TIME:
-                        # Try to recover master
-                        skeleton_count = len(current_skeletons_in_frame_data)
-                        
-                        if skeleton_count == 0:
-                            # No skeletons detected
-                            announce_message("Master I can't see you, please come in front of me")
-                            print("No skeletons detected after occlusion, asking master to come in front")
-                            is_in_occlusion_mode = False
-                            occlusion_detection_buffer.clear()
-                            
-                        elif skeleton_count == 1:
-                            # Only one skeleton, assume it's master
-                            landmarks, pose_results = current_skeletons_in_frame_data[0]
-                            current_bbox = get_bbox_from_landmarks(landmarks, image_width, image_height)
-                            
-                            # Assign this skeleton as master
-                            new_master_id = next_id
-                            tracked_skeletons[new_master_id] = {
-                                'last_pose': pose_results,
-                                'bbox': current_bbox,
-                                'last_seen_frame': frame_count,
-                                'is_master': True,
-                            }
-                            MASTER_ID = new_master_id
-                            next_id += 1
-                            is_in_occlusion_mode = False
-                            occlusion_detection_buffer.clear()
-                            print(f"Single skeleton detected after occlusion, assigned as master (ID: {MASTER_ID})")
-                            
-                        else:
-                            # Multiple skeletons, need face recognition
-                            announce_message("Master please look at me")
-                            print(f"Multiple skeletons detected after occlusion ({skeleton_count}), asking master to look at camera")
-                            
-                            # Detect faces in the image
-                            face_locations = face_recognition.face_locations(image_rgb)
-                            face_encodings = face_recognition.face_encodings(image_rgb, face_locations)
-                            
-                            if face_encodings:
-                                # Find master face
-                                best_master_face_idx = -1
-                                best_master_distance = float('inf')
-                                
-                                for i, face_encoding in enumerate(face_encodings):
-                                    is_master_face, distance = recognize_master_face([face_encoding])
-                                    if is_master_face and distance < best_master_distance:
-                                        best_master_distance = distance
-                                        best_master_face_idx = i
-                                
-                                if best_master_face_idx != -1:
-                                    # Found master face, find closest skeleton
-                                    top, right, bottom, left = face_locations[best_master_face_idx]
-                                    face_center = [left + (right - left) // 2, top + (bottom - top) // 2]
-                                    
-                                    best_skeleton_idx = -1
-                                    min_distance = float('inf')
-                                    
-                                    for i, (landmarks, pose_results) in enumerate(current_skeletons_in_frame_data):
-                                        current_bbox = get_bbox_from_landmarks(landmarks, image_width, image_height)
-                                        skeleton_center = [current_bbox[0] + current_bbox[2] // 2, current_bbox[1] + current_bbox[3] // 2]
-                                        distance = np.sqrt((face_center[0] - skeleton_center[0])**2 + (face_center[1] - skeleton_center[1])**2)
-                                        
-                                        if distance < min_distance:
-                                            min_distance = distance
-                                            best_skeleton_idx = i
-                                    
-                                    if best_skeleton_idx != -1:
-                                        # Assign closest skeleton to master face as master
-                                        landmarks, pose_results = current_skeletons_in_frame_data[best_skeleton_idx]
-                                        current_bbox = get_bbox_from_landmarks(landmarks, image_width, image_height)
-                                        
-                                        new_master_id = next_id
-                                        tracked_skeletons[new_master_id] = {
-                                            'last_pose': pose_results,
-                                            'bbox': current_bbox,
-                                            'last_seen_frame': frame_count,
-                                            'is_master': True,
-                                        }
-                                        MASTER_ID = new_master_id
-                                        next_id += 1
-                                        is_in_occlusion_mode = False
-                                        occlusion_detection_buffer.clear()
-                                        print(f"Master face recognized, assigned closest skeleton as master (ID: {MASTER_ID})")
-                                    else:
-                                        announce_message("Master I can't see you, please come in front of me")
-                                        print("No suitable skeleton found for master face")
-                                        is_in_occlusion_mode = False
-                                        occlusion_detection_buffer.clear()
-                                else:
-                                    announce_message("Master I can't see you, please come in front of me")
-                                    print("No master face recognized after occlusion")
-                                    is_in_occlusion_mode = False
-                                    occlusion_detection_buffer.clear()
-                            else:
-                                announce_message("Master I can't see you, please come in front of me")
-                                print("No faces detected after occlusion")
-                                is_in_occlusion_mode = False
-                                occlusion_detection_buffer.clear()
+                occlusion_detected = detect_occlusion(current_skeletons_in_frame_data, frame_count, image_width, image_height)
             
             # --- 3. Different logic based on recording stage ---
             if not MASTER_FACE_RECORDED:
@@ -712,7 +594,7 @@ def main():
                         master_status_text = f"Master Status: Tracking (ID: {MASTER_ID})"
                     else:
                         if occlusion_detected:
-                            master_status_text = f"Master Status: Occluded ({occlusion_detection_buffer.count(True)} frames)"
+                            master_status_text = f"Master Status: Occluded ({MASTER_OCCLUSION_FRAMES} frames)"
                         else:
                             master_status_text = "Master Status: Attempting Re-identification..."
                 
@@ -763,9 +645,8 @@ def main():
                 MASTER_POSE_BUFFER = []
                 MASTER_FACE_RECORDED = False
                 MASTER_SKELETON_RECORDED = False
-                is_in_occlusion_mode = False
-                occlusion_detection_buffer.clear()
-                occlusion_start_time = None
+                MASTER_LAST_KNOWN_POSITION = None
+                MASTER_OCCLUSION_FRAMES = 0
                 step2_introduced = False  # Reset step 2 introduction flag
                 print("--- All recorded information and master status has been reset ---")
                 print("=== Back to Step 1: Face Recording ===")
