@@ -5,6 +5,7 @@ from ultralytics import YOLO # For general object detection (people, faces)
 import pyttsx3 # For text-to-speech
 import face_recognition # For face recognition and re-identification
 import time # For precise timing in occlusion
+import threading
 
 # --- MediaPipe Initialization ---
 mp_pose = mp.solutions.pose
@@ -17,10 +18,20 @@ engine.setProperty('rate', 150) # Speed of speech
 engine.setProperty('volume', 0.9) # Volume (0.0 to 1.0)
 
 def announce(text):
-    """Speaks the given text."""
+    """Speaks the given text in a non-blocking way to prevent UI freezing."""
     print(f"ANNOUNCEMENT: {text}")
-    engine.say(text)
-    engine.runAndWait()
+    
+    def speak():
+        try:
+            engine.say(text)
+            engine.runAndWait()
+        except Exception as e:
+            print(f"TTS Error: {e}")
+    
+    # Run TTS in a separate thread to avoid blocking
+    tts_thread = threading.Thread(target=speak)
+    tts_thread.daemon = True
+    tts_thread.start()
 
 # --- Global Variables and Configuration Parameters ---
 # Skeleton tracker related (for MediaPipe poses)
@@ -38,7 +49,7 @@ MASTER_FACE_RECORDED = False # Whether master face has been recorded
 MASTER_SKELETON_RECORDED = False # Whether master skeleton has been recorded
 
 # Occlusion handling related (IoU-based)
-OCCLUSION_IOU_THRESHOLD = 0.15 # IoU threshold to consider an occlusion (lowered for more sensitive detection)
+OCCLUSION_IOU_THRESHOLD = 0.4 # IoU threshold to consider an occlusion (lowered for more sensitive detection)
 OCCLUSION_STOP_SECONDS = 3 # Time in seconds to stop and wait after occlusion (reduced for faster debugging)
 WAIT_AFTER_NO_DETECTION_SECONDS = 3 # Time to wait when no one is detected before trying face recognition
 OCCLUSION_START_TIME = None # Timestamp when occlusion started
@@ -52,13 +63,22 @@ OCCLUSION_DISTANCE_THRESHOLD = 150
 
 # Detection thresholds
 YOLO_PERSON_CONFIDENCE_THRESHOLD = 0.5 # Minimum confidence for YOLO to detect a person
-FACE_RECOGNITION_TOLERANCE = 0.4 # Face recognition tolerance, smaller value = stricter
+FACE_RECOGNITION_TOLERANCE = 0.3 # Face recognition tolerance, smaller value = stricter
 MIN_PERSON_AREA_THRESHOLD = 0.01 # Minimum relative area (bbox_area / image_area) for a person to be considered significant
 
 # State variables
 current_state = "STEP1_FACE_RECORDING"  # STEP1_FACE_RECORDING, STEP2_SKELETON_RECORDING, STEP3_TRACKING, OCCLUSION_WAIT, RECOVERY_WAIT
 occlusion_detected = False
 recovery_mode = ""  # "SINGLE_PERSON", "MULTIPLE_PEOPLE", "NO_PEOPLE"
+
+# STEP1 performance optimization variables
+STEP1_FACE_DETECTION_INTERVAL = 3  # Only detect faces every N frames in STEP1
+step1_last_face_detection_frame = 0
+step1_cached_face_data = {'locations': [], 'encodings': []}
+
+# STEP3 master direction detection variables
+master_last_center_x = None  # Track master's last horizontal position
+master_disappeared_direction = None  # "LEFT", "RIGHT", or None
 
 # --- Helper Functions ---
 
@@ -316,11 +336,43 @@ def detect_occlusion(current_skeletons_data, frame_idx, image_width, image_heigh
         
         return False
 
+def detect_master_disappearance_direction(image_width):
+    """Detect which direction the master disappeared from (LEFT or RIGHT) based on last known position."""
+    global master_last_center_x, master_disappeared_direction
+    
+    if master_last_center_x is None:
+        return None
+    
+    # Define screen zones for direction detection
+    screen_center = image_width / 2
+    left_zone_threshold = screen_center * 0.8  # 40% from left edge
+    right_zone_threshold = screen_center * 1.2  # 40% from right edge
+    
+    if master_last_center_x < left_zone_threshold:
+        master_disappeared_direction = "LEFT"
+        return "LEFT"
+    elif master_last_center_x > right_zone_threshold:
+        master_disappeared_direction = "RIGHT"
+        return "RIGHT"
+    else:
+        # Master was in the center area
+        master_disappeared_direction = "CENTER"
+        return "CENTER"
+
+def update_master_position_tracking(master_bbox):
+    """Update master's position for direction tracking (STEP3 only)."""
+    global master_last_center_x
+    
+    if master_bbox and len(master_bbox) >= 4:
+        # Calculate center x position of master's bounding box
+        master_last_center_x = master_bbox[0] + master_bbox[2] / 2
+
 # --- Main Program Logic ---
 def main():
     global MASTER_ID, MASTER_FACE_ENCODINGS, MASTER_POSE_BUFFER, next_id, tracked_skeletons
     global MASTER_FACE_RECORDED, MASTER_SKELETON_RECORDED, MASTER_LAST_KNOWN_POSITION, MASTER_OCCLUSION_FRAMES
     global current_state, OCCLUSION_START_TIME, WAIT_START_TIME, occlusion_detected, recovery_mode
+    global master_last_center_x, master_disappeared_direction
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -351,6 +403,11 @@ def main():
         frame_count = 0
         step2_introduced = False
         
+        # FPS monitoring for performance validation
+        fps_start_time = time.time()
+        fps_frame_count = 0
+        current_fps = 0
+        
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -380,9 +437,22 @@ def main():
 
             # Different logic based on current state
             if current_state == "STEP1_FACE_RECORDING":
-                # STEP 1: Record master face (close to camera) - EXACT same as human_tracking.py
-                face_locations = face_recognition.face_locations(image_rgb)
-                face_encodings = face_recognition.face_encodings(image_rgb, face_locations)
+                # STEP 1: Record master face (close to camera) - Optimized for performance
+                global step1_last_face_detection_frame, step1_cached_face_data
+                
+                # Only perform face detection every STEP1_FACE_DETECTION_INTERVAL frames to reduce latency
+                if frame_count - step1_last_face_detection_frame >= STEP1_FACE_DETECTION_INTERVAL:
+                    face_locations = face_recognition.face_locations(image_rgb)
+                    face_encodings = face_recognition.face_encodings(image_rgb, face_locations)
+                    step1_cached_face_data = {
+                        'locations': face_locations,
+                        'encodings': face_encodings
+                    }
+                    step1_last_face_detection_frame = frame_count
+                else:
+                    # Use cached face detection results
+                    face_locations = step1_cached_face_data['locations']
+                    face_encodings = step1_cached_face_data['encodings']
                 
                 cv2.putText(image_bgr, "STEP 1: Record Master Face (Close to camera)", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
@@ -392,23 +462,27 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 1, cv2.LINE_AA)
                 cv2.putText(image_bgr, "Press 's' to record face, 'n' to proceed", (10, 120),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(image_bgr, f"Optimized Mode (Every {STEP1_FACE_DETECTION_INTERVAL} frames)", (10, 150),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
                 
                 for (top, right, bottom, left) in face_locations:
                     cv2.rectangle(image_bgr, (left, top), (right, bottom), (0, 255, 0), 2)
                     cv2.putText(image_bgr, "Found Face (Press 's')", (left, top - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
                 
-                for s_id, s_data in tracked_skeletons.items():
-                    color = (128, 128, 128)
-                    label = f"ID: {s_id} (Not Master Yet)"
-                    
-                    mp_drawing.draw_landmarks(image_bgr, s_data['last_pose'].pose_landmarks, mp_pose.POSE_CONNECTIONS,
-                                             mp_drawing.DrawingSpec(color=(128,128,128), thickness=2, circle_radius=2),
-                                             mp_drawing.DrawingSpec(color=(128,128,128), thickness=2, circle_radius=2))
+                # Only process skeletons if needed (reduce unnecessary computation in STEP1)
+                if tracked_skeletons:
+                    for s_id, s_data in tracked_skeletons.items():
+                        color = (128, 128, 128)
+                        label = f"ID: {s_id} (Not Master Yet)"
+                        
+                        mp_drawing.draw_landmarks(image_bgr, s_data['last_pose'].pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                                                 mp_drawing.DrawingSpec(color=(128,128,128), thickness=2, circle_radius=2),
+                                                 mp_drawing.DrawingSpec(color=(128,128,128), thickness=2, circle_radius=2))
 
-                    x, y, w, h = s_data['bbox']
-                    cv2.rectangle(image_bgr, (x, y), (x + w, y + h), color, 2)
-                    cv2.putText(image_bgr, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                        x, y, w, h = s_data['bbox']
+                        cv2.rectangle(image_bgr, (x, y), (x + w, y + h), color, 2)
+                        cv2.putText(image_bgr, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
             elif current_state == "STEP2_SKELETON_RECORDING":
                 # STEP 2: Record master skeleton - EXACT same as human_tracking.py
@@ -503,6 +577,31 @@ def main():
                 # Check if master is still being tracked
                 master_in_view = (MASTER_ID != -1 and MASTER_ID in tracked_skeletons and tracked_skeletons[MASTER_ID]['is_master'])
                 
+                # STEP3: Master direction detection - Track master position and detect disappearance direction
+                previous_master_in_view = master_last_center_x is not None
+                
+                if master_in_view:
+                    # Update master's position for direction tracking
+                    master_skel_bbox = tracked_skeletons[MASTER_ID]['bbox']
+                    update_master_position_tracking(master_skel_bbox)
+                    
+                    # Clear any previous disappearance direction since master is back
+                    if master_disappeared_direction is not None:
+                        print(f"Master reappeared! Previously disappeared from {master_disappeared_direction}")
+                        master_disappeared_direction = None
+                
+                elif previous_master_in_view and not master_in_view:
+                    # Master just disappeared - detect direction
+                    direction = detect_master_disappearance_direction(image_width)
+                    if direction:
+                        print(f"*** 主人骨架从视野{direction}边消失 ***")
+                        if direction == "LEFT":
+                            announce("Master disappeared from the left side")
+                        elif direction == "RIGHT":
+                            announce("Master disappeared from the right side")
+                        else:
+                            announce("Master disappeared from the center")
+                
                 if master_in_view:
                     # Find master's YOLO bounding box
                     master_yolo_bbox = None
@@ -538,12 +637,20 @@ def main():
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                         cv2.putText(image_bgr, f"Max IoU: {max_iou:.2f}", (10, 90),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        # Display master position for direction tracking
+                        if master_last_center_x is not None:
+                            cv2.putText(image_bgr, f"Master X: {master_last_center_x:.0f}", (10, 110),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                     else:
                         cv2.putText(image_bgr, f"Master Status: Skeleton tracked, YOLO lost", (10, 60),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
                 else:
                     cv2.putText(image_bgr, "Master Status: Lost", (10, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    # Display last known disappearance direction
+                    if master_disappeared_direction:
+                        cv2.putText(image_bgr, f"Disappeared from: {master_disappeared_direction}", (10, 90),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 100), 1)
 
                 # Master re-identification (from human_tracking.py logic)
                 is_master_present_this_frame = False
@@ -647,16 +754,27 @@ def main():
                     announce("Occlusion period ended. Resuming tracking.")
                     print("IoU-based occlusion period ended.")
 
+            # FPS monitoring for performance validation
+            fps_frame_count += 1
+            if time.time() - fps_start_time >= 1.0:
+                current_fps = fps_frame_count / (time.time() - fps_start_time)
+                fps_start_time = time.time()
+                fps_frame_count = 0
+
+            # Display FPS on all states (especially important for STEP1 performance monitoring)
+            cv2.putText(image_bgr, f"FPS: {current_fps:.1f}", (image_width - 120, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
             cv2.imshow('Human Following Algorithm', image_bgr)
 
-            # Handle key presses - EXACT same as human_tracking.py
+            # Handle key presses - Optimized for STEP1 performance
             key = cv2.waitKey(1) & 0xFF
             if key == ord('s') and current_state == "STEP1_FACE_RECORDING":
-                face_locations = face_recognition.face_locations(image_rgb)
-                face_encodings = face_recognition.face_encodings(image_rgb, face_locations)
+                # Use cached face detection results to avoid recomputation
+                face_encodings_to_record = step1_cached_face_data['encodings']
                 
                 total_recorded = 0
-                for face_encoding in face_encodings:
+                for face_encoding in face_encodings_to_record:
                     MASTER_FACE_ENCODINGS.append(face_encoding)
                     total_recorded += 1
                     print(f"--- Recorded {len(MASTER_FACE_ENCODINGS)}th master face information ---")
@@ -665,7 +783,7 @@ def main():
                     print(f"Currently recorded {len(MASTER_FACE_ENCODINGS)} face information")
                     announce(f"Recorded {total_recorded} face samples.")
                 else:
-                    print("No face detected, cannot record face information. Please ensure you are facing the camera.")
+                    print("No face detected in cached data, cannot record face information. Please ensure you are facing the camera.")
                     announce("No face detected. Please face the camera.")
 
             elif key == ord('n') and current_state == "STEP1_FACE_RECORDING":
@@ -681,7 +799,7 @@ def main():
                     announce("Please record your face first.")
 
             elif key == ord('r'):
-                # Reset everything
+                # Reset everything including STEP1 optimization variables
                 MASTER_FACE_ENCODINGS = []
                 MASTER_ID = -1
                 MASTER_POSE_BUFFER = []
@@ -697,6 +815,12 @@ def main():
                 recovery_mode = ""
                 step2_introduced = False
                 yolo_model = None
+                # Reset STEP1 optimization variables
+                step1_last_face_detection_frame = 0
+                step1_cached_face_data = {'locations': [], 'encodings': []}
+                # Reset STEP3 direction detection variables
+                master_last_center_x = None
+                master_disappeared_direction = None
                 print("--- All recorded information and master status has been reset ---")
                 print("=== Back to Step 1: Face Recording ===")
                 announce("System reset. Please record your face again.")

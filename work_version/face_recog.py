@@ -5,7 +5,7 @@ import time
 
 # --- Configuration Parameters ---
 MASTER_FACE_ENCODING = None # Store master face encoding
-FACE_RECOGNITION_TOLERANCE = 0.4 # Face recognition tolerance, smaller value = stricter (0.6 is common default)
+FACE_RECOGNITION_TOLERANCE = 0.2 # Face recognition tolerance, smaller value = stricter (0.6 is common default)
 MASTER_FACE_ENCODINGS = [] # Store multiple master face encodings for better recognition
 
 # --- Main Program Logic ---
