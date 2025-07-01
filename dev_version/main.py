@@ -38,8 +38,8 @@ MASTER_FACE_RECORDED = False # Whether master face has been recorded
 MASTER_SKELETON_RECORDED = False # Whether master skeleton has been recorded
 
 # Occlusion handling related (IoU-based)
-OCCLUSION_IOU_THRESHOLD = 0.25 # IoU threshold to consider an occlusion
-OCCLUSION_STOP_SECONDS = 5 # Time in seconds to stop and wait after occlusion
+OCCLUSION_IOU_THRESHOLD = 0.15 # IoU threshold to consider an occlusion (lowered for more sensitive detection)
+OCCLUSION_STOP_SECONDS = 3 # Time in seconds to stop and wait after occlusion (reduced for faster debugging)
 WAIT_AFTER_NO_DETECTION_SECONDS = 3 # Time to wait when no one is detected before trying face recognition
 OCCLUSION_START_TIME = None # Timestamp when occlusion started
 WAIT_START_TIME = None # Timestamp when waiting period started (for no detection scenario)
