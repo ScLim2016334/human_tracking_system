@@ -68,7 +68,7 @@ WAIT_START_TIME = None # Timestamp when waiting period started (for no detection
 # Original occlusion handling for tracking (from human_tracking.py)
 MASTER_LAST_KNOWN_POSITION = None
 MASTER_OCCLUSION_FRAMES = 0
-MAX_OCCLUSION_FRAMES = 30
+# MAX_OCCLUSION_FRAMES = 30 # <--- REMOVED: No longer need this for "fully lost" state
 OCCLUSION_DISTANCE_THRESHOLD = 150
 
 # Detection thresholds
@@ -78,14 +78,14 @@ MIN_PERSON_AREA_THRESHOLD = 0.01 # Minimum relative area (bbox_area / image_area
 
 # State variables
 current_state = "STEP1_FACE_RECORDING"  # STEP1_FACE_RECORDING, STEP2_SKELETON_RECORDING, STEP3_TRACKING, OCCLUSION_WAIT, RECOVERY_WAIT
-occlusion_detected = False
+occlusion_detected = False # This can be local to STEP3 now or unused.
 recovery_mode = ""  # "SINGLE_PERSON", "MULTIPLE_PEOPLE", "NO_PEOPLE"
 
 # STEP1 performance optimization variables
 STEP1_FACE_DETECTION_INTERVAL = 3   # Only detect faces every N frames in STEP1
 step1_last_face_detection_frame = 0
 step1_cached_face_data = {'locations': [], 'encodings': []}
-STEP1_CAPTURE_INTERVAL = 5 # Seconds between face captures
+STEP1_CAPTURE_INTERVAL = 3 # Seconds between face captures
 STEP1_LAST_CAPTURE_TIME = 0
 STEP1_CAPTURE_COUNT = 0
 STEP1_TOTAL_CAPTURES = 3 # Left, Front, Right
@@ -152,7 +152,7 @@ def update_skeleton_ids(current_skeletons_data, frame_idx, image_width, image_he
     global next_id, tracked_skeletons, MASTER_ID
 
     new_tracked_skeletons = {}
-    matched_current_indices = set()
+    # matched_current_indices = set() # This variable is not used after setting. Can remove.
 
     for current_idx, (landmarks, pose_results) in enumerate(current_skeletons_data):
         current_center = np.mean([[lm.x, lm.y] for lm in landmarks.landmark], axis=0) * np.array([image_width, image_height])
@@ -170,14 +170,19 @@ def update_skeleton_ids(current_skeletons_data, frame_idx, image_width, image_he
                 best_match_id = s_id
         
         if best_match_id != -1 and best_match_id not in new_tracked_skeletons:
+            # Re-confirm master if a match is found near the last known position.
+            # This logic was part of old `detect_occlusion` and caused issues.
+            # Let's trust the ID tracking for master status for now.
+            # The OCCLUSION_DISTANCE_THRESHOLD check here is for preventing re-assigning
+            # a master ID to a seemingly 'new' person too far from where master was last seen.
             if best_match_id == MASTER_ID:
                 if MASTER_LAST_KNOWN_POSITION is not None:
                     distance_to_last_known = np.linalg.norm(current_center - np.array(MASTER_LAST_KNOWN_POSITION))
                     if distance_to_last_known > OCCLUSION_DISTANCE_THRESHOLD:
-                        print(f"Potential occluder detected! Distance from master's last position: {distance_to_last_known:.1f}px")
-                        best_match_id = -1
-                    else:
-                        print(f"Master reappeared! Distance from last position: {distance_to_last_known:.1f}px")
+                        print(f"Potential new person too far from master's last position: {distance_to_last_known:.1f}px. Not re-assigning master.")
+                        best_match_id = -1 # Treat as a new person, not the returning master
+                    # else: # Master reappeared close by. No need to print this frequently.
+                        # print(f"Master reappeared! Distance from last position: {distance_to_last_known:.1f}px")
             
             if best_match_id != -1:
                 new_tracked_skeletons[best_match_id] = {
@@ -186,8 +191,8 @@ def update_skeleton_ids(current_skeletons_data, frame_idx, image_width, image_he
                     'last_seen_frame': frame_idx,
                     'is_master': tracked_skeletons[best_match_id]['is_master'],
                 }
-                matched_current_indices.add(current_idx)
-            else:
+                # matched_current_indices.add(current_idx) # Not used
+            else: # No good match found, assign new ID
                 new_tracked_skeletons[next_id] = {
                     'last_pose': pose_results,
                     'bbox': current_bbox,
@@ -195,8 +200,8 @@ def update_skeleton_ids(current_skeletons_data, frame_idx, image_width, image_he
                     'is_master': False,
                 }
                 next_id += 1
-                matched_current_indices.add(current_idx)
-        else:
+                # matched_current_indices.add(current_idx) # Not used
+        else: # No good match found or match already taken, assign new ID
             new_tracked_skeletons[next_id] = {
                 'last_pose': pose_results,
                 'bbox': current_bbox,
@@ -204,18 +209,20 @@ def update_skeleton_ids(current_skeletons_data, frame_idx, image_width, image_he
                 'is_master': False,
             }
             next_id += 1
-            matched_current_indices.add(current_idx)
+            # matched_current_indices.add(current_idx) # Not used
 
     temp_tracked_skeletons = {}
-    for s_id, s_data in new_tracked_skeletons.items():
+    for s_id, s_data in tracked_skeletons.items(): # Keep old tracked skeletons that are still within MAX_MISS_FRAMES
         if frame_idx - s_data['last_seen_frame'] <= MAX_MISS_FRAMES:
             temp_tracked_skeletons[s_id] = s_data
-        else:
-            if s_id == MASTER_ID:
-                MASTER_ID = -1 
-                print(f"Master ID {s_id} skeleton not seen for a long time, resetting master status.")
-    
+    # Note: MASTER_ID's 'is_master' flag will be maintained by detect_occlusion and re-identification logic
+
+    # Add newly found/matched skeletons
+    for s_id, s_data in new_tracked_skeletons.items():
+        temp_tracked_skeletons[s_id] = s_data # Overwrite if existing, add if new
+
     tracked_skeletons = temp_tracked_skeletons
+
 
 def is_hands_on_hips(landmarks):
     """Determine if MediaPipe keypoints represent 'hands on hips' action."""
@@ -311,44 +318,41 @@ def recognize_master_face(face_encodings):
     return is_master, best_distance
 
 def detect_occlusion(current_skeletons_data, frame_idx, image_width, image_height):
-    """Detect potential occlusion of master by other people."""
+    """
+    Manages MASTER_LAST_KNOWN_POSITION and MASTER_OCCLUSION_FRAMES.
+    Returns True if master is NOT tracked by MediaPipe but a skeleton is nearby.
+    Master's last known position is NOT reset to None here.
+    """
     global MASTER_LAST_KNOWN_POSITION, MASTER_OCCLUSION_FRAMES, MASTER_ID
     
-    if MASTER_ID == -1 or MASTER_LAST_KNOWN_POSITION is None:
-        return False
+    if MASTER_ID == -1:
+        return False # No master to track for occlusion logic
     
-    master_currently_tracked = False
-    master_current_position = None
+    master_currently_tracked_by_mediapipe = (MASTER_ID in tracked_skeletons and tracked_skeletons[MASTER_ID]['is_master'])
     
-    for s_id, s_data in tracked_skeletons.items():
-        if s_id == MASTER_ID and s_data['is_master']:
-            master_currently_tracked = True
-            master_current_position = [s_data['bbox'][0] + s_data['bbox'][2] // 2, 
-                                        s_data['bbox'][1] + s_data['bbox'][3] // 2]
-            break
-    
-    if master_currently_tracked:
+    if master_currently_tracked_by_mediapipe:
+        master_current_position = [tracked_skeletons[MASTER_ID]['bbox'][0] + tracked_skeletons[MASTER_ID]['bbox'][2] // 2, 
+                                   tracked_skeletons[MASTER_ID]['bbox'][1] + tracked_skeletons[MASTER_ID]['bbox'][3] // 2]
         MASTER_LAST_KNOWN_POSITION = master_current_position
         MASTER_OCCLUSION_FRAMES = 0
-        return False
+        return False # Master is visible, not "occluded" by this definition
     else:
-        MASTER_OCCLUSION_FRAMES += 1
+        # Master is not currently tracked by MediaPipe.
+        MASTER_OCCLUSION_FRAMES += 1 # Continue incrementing, but no reset of last known position here.
         
-        for landmarks, pose_results in current_skeletons_data:
-            current_center = np.mean([[lm.x, lm.y] for lm in landmarks.landmark], axis=0) * np.array([image_width, image_height])
-            distance_to_master = np.linalg.norm(current_center - np.array(MASTER_LAST_KNOWN_POSITION))
-            
-            if distance_to_master < OCCLUSION_DISTANCE_THRESHOLD:
-                print(f"Potential occlusion detected! Distance to master: {distance_to_master:.1f}px")
-                return True
+        # Check if another skeleton is nearby, implying potential occlusion.
+        if MASTER_LAST_KNOWN_POSITION is not None:
+            for landmarks, pose_results in current_skeletons_data:
+                current_center = np.mean([[lm.x, lm.y] for lm in landmarks.landmark], axis=0) * np.array([image_width, image_height])
+                distance_to_master = np.linalg.norm(current_center - np.array(MASTER_LAST_KNOWN_POSITION))
+                
+                if distance_to_master < OCCLUSION_DISTANCE_THRESHOLD:
+                    # Another skeleton is close to where the master was. This is a potential occlusion.
+                    # print(f"Master not seen, but potential occluder detected nearby! Distance: {distance_to_master:.1f}px") # Debug print
+                    return True # Indicate potential short-term occlusion by another person
         
-        if MASTER_OCCLUSION_FRAMES > MAX_OCCLUSION_FRAMES:
-            print(f"Master lost after {MASTER_OCCLUSION_FRAMES} frames of occlusion")
-            MASTER_LAST_KNOWN_POSITION = None
-            MASTER_OCCLUSION_FRAMES = 0
-            return False
-        
-        return False
+        return False # Master not tracked, no nearby skeleton.
+
 
 def detect_master_disappearance_direction(image_width):
     """Detect which direction the master disappeared from (LEFT or RIGHT) based on last known position."""
@@ -359,8 +363,8 @@ def detect_master_disappearance_direction(image_width):
     
     # Define screen zones for direction detection
     screen_center = image_width / 2
-    left_zone_threshold = screen_center * 0.8  # 40% from left edge
-    right_zone_threshold = screen_center * 1.2  # 40% from right edge
+    left_zone_threshold = screen_center * 0.3  # Closer to edge for disappearance
+    right_zone_threshold = screen_center * 1.7  # Closer to edge for disappearance
     
     if master_last_center_x < left_zone_threshold:
         master_disappeared_direction = "LEFT"
@@ -369,7 +373,8 @@ def detect_master_disappearance_direction(image_width):
         master_disappeared_direction = "RIGHT"
         return "RIGHT"
     else:
-        # Master was in the center area
+        # Master was in the center area, hard to say direction definitively.
+        # Could imply they moved directly away or towards camera, or fell.
         master_disappeared_direction = "CENTER"
         return "CENTER"
 
@@ -443,20 +448,14 @@ def main():
             if results.pose_landmarks:
                 current_skeletons_in_frame_data.append((results.pose_landmarks, results))
 
-            # Update skeleton IDs
+            # Update skeleton IDs (MediaPipe tracking)
             update_skeleton_ids(current_skeletons_in_frame_data, frame_count, image_width, image_height)
             
-            # Occlusion detection (only in normal tracking mode)
-            occlusion_detected_original = False
-            if MASTER_SKELETON_RECORDED and MASTER_ID != -1:
-                occlusion_detected_original = detect_occlusion(current_skeletons_in_frame_data, frame_count, image_width, image_height)
-
-            # Different logic based on current state
+            # --- State Machine Logic ---
             if current_state == "STEP1_FACE_RECORDING":
                 # STEP 1: Record master face (close to camera) - Optimized and Automated
                 global step1_last_face_detection_frame, step1_cached_face_data
                 
-                # Only perform face detection every STEP1_FACE_DETECTION_INTERVAL frames
                 if frame_count - step1_last_face_detection_frame >= STEP1_FACE_DETECTION_INTERVAL:
                     face_locations = face_recognition.face_locations(image_rgb)
                     face_encodings = face_recognition.face_encodings(image_rgb, face_locations)
@@ -465,9 +464,7 @@ def main():
                         'encodings': face_encodings
                     }
                     step1_last_face_detection_frame = frame_count
-                # Else, use cached face detection results
 
-                # Automatic capture logic
                 current_time = time.time()
                 if STEP1_CAPTURE_COUNT < STEP1_TOTAL_CAPTURES:
                     if current_time - STEP1_LAST_CAPTURE_TIME >= STEP1_CAPTURE_INTERVAL:
@@ -506,7 +503,6 @@ def main():
                     else:
                         print("No faces were successfully recorded. Please reset and try again.")
                         announce("No faces were recorded. Please reset the system to try again.")
-                        # Optionally, go back to a waiting state or reset state
                         STEP1_CAPTURE_COUNT = 0 # Allow retrying if no faces were recorded
 
                 cv2.putText(image_bgr, "STEP 1: Record Master Face", (10, 30),
@@ -518,7 +514,6 @@ def main():
                 cv2.putText(image_bgr, f"Next capture in: {max(0, STEP1_CAPTURE_INTERVAL - (current_time - STEP1_LAST_CAPTURE_TIME)):.1f}s", (10, 120),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
                 
-                # Display current instruction for face capture
                 if STEP1_CAPTURE_COUNT == 0:
                     instruction_text = "Look Left for next capture"
                 elif STEP1_CAPTURE_COUNT == 1:
@@ -530,7 +525,6 @@ def main():
                 cv2.putText(image_bgr, instruction_text, (10, 150),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 0), 2, cv2.LINE_AA)
                 
-                # Draw detected faces
                 for (top, right, bottom, left) in step1_cached_face_data['locations']:
                     cv2.rectangle(image_bgr, (left, top), (right, bottom), (0, 255, 0), 2)
                     cv2.putText(image_bgr, "Detected Face", (left, top - 10),
@@ -565,17 +559,13 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 1, cv2.LINE_AA)
                 
                 if current_skeletons_in_frame_data:
-                    # Find the closest skeleton based on the Y-coordinate (lower Y is usually closer to bottom of frame)
-                    # Or, more robustly, based on bbox area (larger bbox usually means closer)
-                    # For simplicity, let's use bbox area here, assuming larger means closer
-                    
                     closest_skeleton_id = -1
                     max_bbox_area = 0
 
                     for s_id, s_data in tracked_skeletons.items():
-                        if s_data['last_seen_frame'] == frame_count: # Only consider currently detected skeletons
+                        if s_data['last_seen_frame'] == frame_count:
                             bbox = s_data['bbox']
-                            bbox_area = bbox[2] * bbox[3] # width * height
+                            bbox_area = bbox[2] * bbox[3]
                             
                             if bbox_area > max_bbox_area:
                                 max_bbox_area = bbox_area
@@ -595,10 +585,6 @@ def main():
                             announce("Master skeleton selected! Starting enhanced tracking mode.")
                             print(f"--- Master skeleton {MASTER_ID} automatically selected! ---")
                         else:
-                            # If master was already recorded, but we are still in STEP2 for some reason,
-                            # ensure the master flag is correct or transition to STEP3.
-                            # This block might not be strictly needed if state transition is perfect,
-                            # but acts as a safeguard.
                             if MASTER_ID not in tracked_skeletons or not tracked_skeletons[MASTER_ID]['is_master']:
                                 MASTER_ID = closest_skeleton_id
                                 tracked_skeletons[MASTER_ID]['is_master'] = True
@@ -607,14 +593,13 @@ def main():
                                                               master_bbox[1] + master_bbox[3] // 2]
                                 announce("Master re-selected. Resuming tracking.")
                                 print(f"--- Master skeleton re-selected to {MASTER_ID} ---")
-                            current_state = "STEP3_TRACKING" # Ensure transition to tracking
-
+                            current_state = "STEP3_TRACKING"
 
                 for s_id, s_data in tracked_skeletons.items():
                     color = (0, 255, 0)
                     label = f"ID: {s_id}"
                     
-                    if s_id == MASTER_ID and s_data['is_master']: # Use MASTER_ID to check for master
+                    if s_id == MASTER_ID and s_data['is_master']:
                         color = (0, 0, 255)
                         label = f"Master ID: {s_id}"
                     
@@ -627,7 +612,6 @@ def main():
                     cv2.putText(image_bgr, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
             elif current_state == "STEP3_TRACKING":
-                # STEP 3: Enhanced tracking with MediaPipe + YOLO parallel processing
                 if yolo_model is None:
                     try:
                         print("Loading YOLO model for enhanced tracking mode...")
@@ -636,151 +620,174 @@ def main():
                     except Exception as e:
                         print(f"Error loading YOLO model: {e}")
                         announce("Error: Could not load object detection model.")
-                        current_state = "STEP2_SKELETON_RECORDING" # Fallback
+                        current_state = "STEP2_SKELETON_RECORDING"
                         continue
 
                 cv2.putText(image_bgr, "STEP 3: Enhanced Tracking (MediaPipe + YOLO)", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
-                # Parallel processing: MediaPipe + YOLO
+                # --- Core logic for occlusion vs. disappearance prioritization ---
+
+                # 1. Update MediaPipe's internal master loss counters and last known position
+                # This function now purely manages MASTER_LAST_KNOWN_POSITION and MASTER_OCCLUSION_FRAMES
+                # and returns True if master is lost but another skeleton is nearby.
+                is_master_mediapipe_lost_and_another_skeleton_nearby = detect_occlusion(current_skeletons_in_frame_data, frame_count, image_width, image_height)
+
+                # 2. Get YOLO person detections
                 person_detections = get_person_detections(yolo_model, image_bgr, YOLO_PERSON_CONFIDENCE_THRESHOLD)
                 significant_persons = filter_significant_persons(person_detections, image_width, image_height, MIN_PERSON_AREA_THRESHOLD)
 
-                # Check if master is still being tracked
-                master_in_view = (MASTER_ID != -1 and MASTER_ID in tracked_skeletons and tracked_skeletons[MASTER_ID]['is_master'])
-                
-                # STEP3: Master direction detection - Track master position and detect disappearance direction
-                previous_master_in_view = master_last_center_x is not None
-                
-                if master_in_view:
-                    # Update master's position for direction tracking
+                # 3. Determine if master skeleton is currently tracked by MediaPipe
+                master_is_tracked_by_mediapipe_this_frame = (MASTER_ID != -1 and MASTER_ID in tracked_skeletons and tracked_skeletons[MASTER_ID]['is_master'])
+
+                # Store previous master visibility for disappearance detection
+                previous_master_was_tracked = (master_last_center_x is not None)
+
+                # --- Scenario A: Master skeleton IS currently tracked by MediaPipe ---
+                if master_is_tracked_by_mediapipe_this_frame:
                     master_skel_bbox = tracked_skeletons[MASTER_ID]['bbox']
-                    update_master_position_tracking(master_skel_bbox)
+                    update_master_position_tracking(master_skel_bbox) # Update master's x position
                     
-                    # Clear any previous disappearance direction since master is back
-                    if master_disappeared_direction is not None:
+                    # Announce disappearance direction only if it was just lost and now reappears.
+                    # If master just reappeared, clear disappearance direction.
+                    if previous_master_was_tracked and master_disappeared_direction is not None:
                         print(f"Master reappeared! Previously disappeared from {master_disappeared_direction}")
-                        master_disappeared_direction = None
-                
-                elif previous_master_in_view and not master_in_view:
-                    # Master just disappeared - detect direction
-                    direction = detect_master_disappearance_direction(image_width)
-                    if direction:
-                        print(f"*** 主人骨架从视野{direction}边消失 ***")
-                        if direction == "LEFT":
-                            announce("Master disappeared from the left side")
-                        elif direction == "RIGHT":
-                            announce("Master disappeared from the right side")
-                        else:
-                            announce("Master disappeared from the center")
-                
-                if master_in_view:
-                    # Find master's YOLO bounding box
-                    master_yolo_bbox = None
-                    master_skel_bbox = tracked_skeletons[MASTER_ID]['bbox']
+                        announce("Master has reappeared!") # New announcement
+                    master_disappeared_direction = None # Reset any disappearance flag
+
+                    # Check for IoU-based occlusion with *other* people while master is visible
+                    max_iou_with_other_person = 0.0
+                    master_yolo_bbox_for_iou_check = None
                     
-                    best_iou = 0
-                    for p_det in significant_persons:
-                        iou = calculate_iou(p_det['bbox'], master_skel_bbox)
-                        if iou > best_iou and iou > 0.3:
-                            best_iou = iou
-                            master_yolo_bbox = p_det['bbox']
-                    
-                    if master_yolo_bbox:
-                        # Check for IoU-based occlusion with other people
-                        max_iou = 0
-                        occlusion_this_frame = False
+                    # Try to find the YOLO bbox that strongly corresponds to the master skeleton
+                    best_iou_to_master_skel_bbox = 0.0
+                    for yolo_p_det in significant_persons:
+                        iou_val = calculate_iou(master_skel_bbox, yolo_p_det['bbox'])
+                        if iou_val > best_iou_to_master_skel_bbox and iou_val > 0.3: # Require a decent overlap
+                            best_iou_to_master_skel_bbox = iou_val
+                            master_yolo_bbox_for_iou_check = yolo_p_det['bbox']
+
+                    if master_yolo_bbox_for_iou_check:
+                        # Now, check for occlusion by other people against this master's YOLO bbox
+                        for p_det_other in significant_persons:
+                            # Ensure we are not comparing the master's YOLO bbox to itself
+                            if p_det_other['bbox'] != master_yolo_bbox_for_iou_check:
+                                iou_val_with_other = calculate_iou(master_yolo_bbox_for_iou_check, p_det_other['bbox'])
+                                max_iou_with_other_person = max(max_iou_with_other_person, iou_val_with_other)
+                                if iou_val_with_other > OCCLUSION_IOU_THRESHOLD:
+                                    # High IoU detected while master is visible -> immediate occlusion
+                                    current_state = "OCCLUSION_WAIT"
+                                    OCCLUSION_START_TIME = time.time()
+                                    announce(f"Occlusion detected! Master please stop for {OCCLUSION_STOP_SECONDS} seconds.")
+                                    print(f"IoU-based occlusion detected (IoU: {max_iou_with_other_person:.2f})!")
+                                    break # Exit inner loop, occlusion confirmed
                         
-                        for p_det in significant_persons:
-                            if p_det['bbox'] != master_yolo_bbox:
-                                iou = calculate_iou(master_yolo_bbox, p_det['bbox'])
-                                max_iou = max(max_iou, iou)
-                                if iou > OCCLUSION_IOU_THRESHOLD:
-                                    occlusion_this_frame = True
-                                    break
-                        
-                        if occlusion_this_frame:
-                            current_state = "OCCLUSION_WAIT"
-                            OCCLUSION_START_TIME = time.time()
-                            announce(f"Occlusion detected! Master please stop for {OCCLUSION_STOP_SECONDS} seconds.")
-                            print(f"IoU-based occlusion detected (IoU: {max_iou:.2f})!")
-                        
-                        cv2.putText(image_bgr, f"Master Status: Tracking (ID: {MASTER_ID})", (10, 60),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                        cv2.putText(image_bgr, f"Max IoU: {max_iou:.2f}", (10, 90),
+                        cv2.putText(image_bgr, f"Max IoU w/Others: {max_iou_with_other_person:.2f}", (10, 90),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                        # Display master position for direction tracking
-                        if master_last_center_x is not None:
-                            cv2.putText(image_bgr, f"Master X: {master_last_center_x:.0f}", (10, 110),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                     else:
-                        cv2.putText(image_bgr, f"Master Status: Skeleton tracked, YOLO lost", (10, 60),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
-                else:
-                    cv2.putText(image_bgr, "Master Status: Lost", (10, 60),
+                        cv2.putText(image_bgr, "Master YOLO not confirmed", (10, 90),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 255), 1)
+
+                    cv2.putText(image_bgr, f"Master Status: Tracking (ID: {MASTER_ID})", (10, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                    # Display last known disappearance direction
-                    if master_disappeared_direction:
-                        cv2.putText(image_bgr, f"Disappeared from: {master_disappeared_direction}", (10, 90),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 100), 1)
+                    if master_last_center_x is not None:
+                        cv2.putText(image_bgr, f"Master X: {master_last_center_x:.0f}", (10, 110),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-                # Master re-identification (from human_tracking.py logic)
-                is_master_present_this_frame = False
-                if MASTER_ID != -1 and MASTER_ID in tracked_skeletons:
-                    is_master_present_this_frame = tracked_skeletons[MASTER_ID]['is_master']
+                # --- Scenario B: Master skeleton is NOT currently tracked by MediaPipe ---
+                else: # Master is lost by MediaPipe
+                    # If master ID was never set (e.g., system just started, or master calibration failed)
+                    if MASTER_ID == -1:
+                        cv2.putText(image_bgr, "Master Status: Not Calibrated", (10, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                        master_disappeared_direction = None
+                    else: # Master was previously tracked (MASTER_ID != -1) but is now lost by MediaPipe in this frame.
+                          # Now it only enters a "searching" state.
 
-                if MASTER_ID != -1 and not is_master_present_this_frame and MASTER_FACE_ENCODINGS and not occlusion_detected_original:
-                    face_locations = face_recognition.face_locations(image_rgb)
-                    face_encodings = face_recognition.face_encodings(image_rgb, face_locations)
-
-                    if face_encodings:
-                        best_master_face_idx = -1
-                        best_master_distance = float('inf')
+                        # Announce disappearance direction only on the FIRST frame it's lost
+                        if previous_master_was_tracked and master_disappeared_direction is None:
+                            direction = detect_master_disappearance_direction(image_width)
+                            if direction:
+                                print(f"*** 主人骨架从视野{direction}边消失 ***")
+                                if direction == "LEFT":
+                                    announce("Master disappeared from the left side")
+                                elif direction == "RIGHT":
+                                    announce("Master disappeared from the right side")
+                                else:
+                                    announce("Master disappeared from the center")
                         
-                        for i, face_encoding in enumerate(face_encodings):
-                            is_master_face, distance = recognize_master_face([face_encoding])
-                            
-                            if is_master_face and distance < best_master_distance:
-                                best_master_distance = distance
-                                best_master_face_idx = i
+                        cv2.putText(image_bgr, f"Master Status: Lost (Searching)", (10, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
+                        cv2.putText(image_bgr, f"Lost for: {MASTER_OCCLUSION_FRAMES} frames", (10, 90),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 165, 0), 1)
+                        if master_disappeared_direction:
+                            cv2.putText(image_bgr, f"Last Direction: {master_disappeared_direction}", (10, 110),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 100), 1)
                         
-                        if best_master_face_idx != -1:
-                            top, right, bottom, left = face_locations[best_master_face_idx]
-                            face_bbox_reid = [left, top, right - left, bottom - top]
-                            face_center = [left + (right - left) // 2, top + (bottom - top) // 2]
+                        # Re-identification attempt: If master is not currently tracked by MediaPipe,
+                        # and we are not in OCCLUSION_WAIT state (which is for explicit IoU occlusions).
+                        # The `is_master_mediapipe_lost_and_another_skeleton_nearby` (from detect_occlusion)
+                        # is a softer "occlusion" signal, which should *not* prevent face re-id.
+                        if current_state == "STEP3_TRACKING" and MASTER_FACE_ENCODINGS:
+                            face_locations = face_recognition.face_locations(image_rgb)
+                            face_encodings = face_recognition.face_encodings(image_rgb, face_locations)
 
-                            best_skeleton_id = -1
-                            best_skeleton_score = -1
-                            
-                            for s_id, s_data in tracked_skeletons.items():
-                                if not s_data['is_master']:
-                                    skeleton_bbox_reid = s_data['bbox']
-                                    skeleton_center = [skeleton_bbox_reid[0] + skeleton_bbox_reid[2] // 2, 
-                                                                    skeleton_bbox_reid[1] + skeleton_bbox_reid[3] // 2]
+                            if face_encodings:
+                                best_master_face_idx = -1
+                                best_master_distance = float('inf')
+                                
+                                for i, face_encoding in enumerate(face_encodings):
+                                    is_master_face, distance = recognize_master_face([face_encoding])
                                     
-                                    iou = calculate_iou(face_bbox_reid, skeleton_bbox_reid)
-                                    center_distance = np.sqrt((face_center[0] - skeleton_center[0])**2 + 
-                                                                (face_center[1] - skeleton_center[1])**2)
-                                    relative_distance = center_distance / np.sqrt(image_width**2 + image_height**2)
+                                    if is_master_face and distance < best_master_distance:
+                                        best_master_distance = distance
+                                        best_master_face_idx = i
+                                
+                                if best_master_face_idx != -1:
+                                    top, right, bottom, left = face_locations[best_master_face_idx]
+                                    face_bbox_reid = [left, top, right - left, bottom - top]
+                                    face_center = [left + (right - left) // 2, top + (bottom - top) // 2]
+
+                                    best_skeleton_id = -1
+                                    best_skeleton_score = -1
                                     
-                                    if iou > 0.05:
-                                        score = iou * 0.7 + (1.0 - relative_distance) * 0.3
-                                    else:
-                                        score = (1.0 - relative_distance) * 0.5
+                                    # Find the skeleton that best matches this re-identified master face
+                                    for s_id, s_data in tracked_skeletons.items():
+                                        # Only consider skeletons that are not currently the master
+                                        # Or are the master, but are currently "lost" by MediaPipe
+                                        if not s_data['is_master'] or (s_id == MASTER_ID and not master_is_tracked_by_mediapipe_this_frame):
+                                            skeleton_bbox_reid = s_data['bbox']
+                                            skeleton_center = [skeleton_bbox_reid[0] + skeleton_bbox_reid[2] // 2, 
+                                                                skeleton_bbox_reid[1] + skeleton_bbox_reid[3] // 2]
+                                            
+                                            iou = calculate_iou(face_bbox_reid, skeleton_bbox_reid)
+                                            center_distance = np.sqrt((face_center[0] - skeleton_center[0])**2 + 
+                                                                        (face_center[1] - skeleton_center[1])**2)
+                                            relative_distance = center_distance / np.sqrt(image_width**2 + image_height**2)
+                                            
+                                            if iou > 0.05:
+                                                score = iou * 0.7 + (1.0 - relative_distance) * 0.3
+                                            else:
+                                                score = (1.0 - relative_distance) * 0.5
+                                            
+                                            if score > best_skeleton_score:
+                                                best_skeleton_score = score
+                                                best_skeleton_id = s_id
                                     
-                                    if score > best_skeleton_score:
-                                        best_skeleton_score = score
-                                        best_skeleton_id = s_id
-                            
-                            if best_skeleton_id != -1 and best_skeleton_score > 0.1:
-                                MASTER_ID = best_skeleton_id
-                                tracked_skeletons[MASTER_ID]['is_master'] = True
-                                master_bbox = tracked_skeletons[MASTER_ID]['bbox']
-                                MASTER_LAST_KNOWN_POSITION = [master_bbox[0] + master_bbox[2] // 2, 
-                                                              master_bbox[1] + master_bbox[3] // 2]
-                                print(f"--- Master {MASTER_ID} re-identification successful! ---")
-                                print(f"Face match distance: {best_master_distance:.3f}")
-                                print(f"Skeleton binding score: {best_skeleton_score:.3f}")
+                                    if best_skeleton_id != -1 and best_skeleton_score > 0.1:
+                                        # Re-assign master if a good match is found
+                                        MASTER_ID = best_skeleton_id
+                                        tracked_skeletons[MASTER_ID]['is_master'] = True
+                                        master_bbox = tracked_skeletons[MASTER_ID]['bbox']
+                                        MASTER_LAST_KNOWN_POSITION = [master_bbox[0] + master_bbox[2] // 2, 
+                                                                      master_bbox[1] + master_bbox[3] // 2]
+                                        MASTER_OCCLUSION_FRAMES = 0 # Reset occlusion frames on re-id
+                                        print(f"--- Master {MASTER_ID} re-identification successful! ---")
+                                        print(f"Face match distance: {best_master_distance:.3f}")
+                                        print(f"Skeleton binding score: {best_skeleton_score:.3f}")
+                                        announce("Master re-identified.")
+                                        master_disappeared_direction = None # Reset direction once re-identified
+
 
                 # Draw MediaPipe skeletons
                 for s_id, s_data in tracked_skeletons.items():
@@ -804,9 +811,10 @@ def main():
                     color = (0, 255, 0)  # Green for others
                     label = f"Person: {p_det['conf']:.2f}"
                     
-                    if master_in_view:
+                    # If master is currently tracked by MediaPipe, try to identify its YOLO bbox
+                    if master_is_tracked_by_mediapipe_this_frame and MASTER_ID in tracked_skeletons:
                         master_skel_bbox = tracked_skeletons[MASTER_ID]['bbox']
-                        if calculate_iou(p_det['bbox'], master_skel_bbox) > 0.3:
+                        if calculate_iou(p_det['bbox'], master_skel_bbox) > 0.3: # If YOLO bbox significantly overlaps with master's skeleton bbox
                             color = (0, 0, 255)  # Red for master
                             label = f"Master: {p_det['conf']:.2f}"
                     
@@ -825,6 +833,39 @@ def main():
                     current_state = "STEP3_TRACKING"
                     announce("Occlusion period ended. Resuming tracking.")
                     print("IoU-based occlusion period ended.")
+                
+                # Still draw skeletons/detections during wait
+                # Get YOLO person detections for drawing
+                person_detections = get_person_detections(yolo_model, image_bgr, YOLO_PERSON_CONFIDENCE_THRESHOLD)
+                
+                # Draw MediaPipe skeletons
+                for s_id, s_data in tracked_skeletons.items():
+                    color = (0, 255, 0)
+                    label = f"ID: {s_id}"
+                    if s_id == MASTER_ID: # Even in wait state, keep track of master if it's there
+                        color = (0, 0, 255)
+                        label = f"Master ID: {s_id} (WAIT)"
+                    mp_drawing.draw_landmarks(image_bgr, s_data['last_pose'].pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                                             mp_drawing.DrawingSpec(color=(245,117,66), thickness=2, circle_radius=2),
+                                             mp_drawing.DrawingSpec(color=(245,66,230), thickness=2, circle_radius=2))
+                    x, y, w, h = s_data['bbox']
+                    cv2.rectangle(image_bgr, (x, y), (x + w, y + h), color, 2)
+                    cv2.putText(image_bgr, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                # Draw YOLO detections
+                for p_det in person_detections:
+                    x, y, w, h = p_det['bbox']
+                    color = (0, 255, 0)
+                    label = f"Person: {p_det['conf']:.2f}"
+                    if MASTER_ID != -1 and MASTER_ID in tracked_skeletons: # Check if master skeleton is still technically tracked (even if occluded)
+                        master_skel_bbox = tracked_skeletons[MASTER_ID]['bbox']
+                        if calculate_iou(p_det['bbox'], master_skel_bbox) > 0.3:
+                            color = (0, 0, 255)
+                            label = f"Master (Occluded): {p_det['conf']:.2f}"
+                    cv2.rectangle(image_bgr, (x, y), (x + w, y + h), color, 2)
+                    cv2.putText(image_bgr, label, (x, y + h + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+
 
             # FPS monitoring for performance validation
             fps_frame_count += 1
@@ -833,7 +874,7 @@ def main():
                 fps_start_time = time.time()
                 fps_frame_count = 0
 
-            # Display FPS on all states (especially important for STEP1 performance monitoring)
+            # Display FPS on all states
             cv2.putText(image_bgr, f"FPS: {current_fps:.1f}", (image_width - 120, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
@@ -842,7 +883,6 @@ def main():
             # Handle key presses
             key = cv2.waitKey(1) & 0xFF
             if key == ord('r'):
-                # Reset everything including STEP1 optimization variables
                 MASTER_FACE_ENCODINGS = []
                 MASTER_ID = -1
                 MASTER_POSE_BUFFER = []
@@ -854,16 +894,14 @@ def main():
                 current_state = "STEP1_FACE_RECORDING"
                 OCCLUSION_START_TIME = None
                 WAIT_START_TIME = None
-                occlusion_detected = False
+                occlusion_detected = False # Reset this too
                 recovery_mode = ""
                 step2_introduced = False
                 yolo_model = None
-                # Reset STEP1 optimization variables
                 step1_last_face_detection_frame = 0
                 step1_cached_face_data = {'locations': [], 'encodings': []}
                 STEP1_LAST_CAPTURE_TIME = 0
                 STEP1_CAPTURE_COUNT = 0
-                # Reset STEP3 direction detection variables
                 master_last_center_x = None
                 master_disappeared_direction = None
                 print("--- All recorded information and master status has been reset ---")

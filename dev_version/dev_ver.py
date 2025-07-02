@@ -68,7 +68,7 @@ WAIT_START_TIME = None # Timestamp when waiting period started (for no detection
 # Original occlusion handling for tracking (from human_tracking.py)
 MASTER_LAST_KNOWN_POSITION = None
 MASTER_OCCLUSION_FRAMES = 0
-MAX_OCCLUSION_FRAMES = 30
+# MAX_OCCLUSION_FRAMES = 30 # <--- REMOVED: No longer need this for "fully lost" state
 OCCLUSION_DISTANCE_THRESHOLD = 150
 
 # Detection thresholds
@@ -215,20 +215,11 @@ def update_skeleton_ids(current_skeletons_data, frame_idx, image_width, image_he
     for s_id, s_data in tracked_skeletons.items(): # Keep old tracked skeletons that are still within MAX_MISS_FRAMES
         if frame_idx - s_data['last_seen_frame'] <= MAX_MISS_FRAMES:
             temp_tracked_skeletons[s_id] = s_data
+    # Note: MASTER_ID's 'is_master' flag will be maintained by detect_occlusion and re-identification logic
 
     # Add newly found/matched skeletons
     for s_id, s_data in new_tracked_skeletons.items():
         temp_tracked_skeletons[s_id] = s_data # Overwrite if existing, add if new
-
-    # Check if master ID was in old tracked_skeletons but not in new_tracked_skeletons (meaning it wasn't seen this frame)
-    # And if it has now exceeded MAX_MISS_FRAMES.
-    if MASTER_ID != -1 and MASTER_ID in tracked_skeletons and MASTER_ID not in new_tracked_skeletons:
-        if frame_idx - tracked_skeletons[MASTER_ID]['last_seen_frame'] > MAX_MISS_FRAMES:
-            print(f"Master ID {MASTER_ID} skeleton not seen for {frame_idx - tracked_skeletons[MASTER_ID]['last_seen_frame']} frames, resetting master status.")
-            # Do NOT reset MASTER_ID here immediately, let main loop handle full loss/disappearance
-            # Just ensure 'is_master' is False if it's truly lost.
-            if MASTER_ID in temp_tracked_skeletons: # If it made it past MAX_MISS_FRAMES cleanup
-                temp_tracked_skeletons[MASTER_ID]['is_master'] = False # Mark as no longer master if lost beyond threshold
 
     tracked_skeletons = temp_tracked_skeletons
 
@@ -330,7 +321,7 @@ def detect_occlusion(current_skeletons_data, frame_idx, image_width, image_heigh
     """
     Manages MASTER_LAST_KNOWN_POSITION and MASTER_OCCLUSION_FRAMES.
     Returns True if master is NOT tracked by MediaPipe but a skeleton is nearby.
-    Resets MASTER_LAST_KNOWN_POSITION to None if master is lost for too long.
+    Master's last known position is NOT reset to None here.
     """
     global MASTER_LAST_KNOWN_POSITION, MASTER_OCCLUSION_FRAMES, MASTER_ID
     
@@ -347,17 +338,9 @@ def detect_occlusion(current_skeletons_data, frame_idx, image_width, image_heigh
         return False # Master is visible, not "occluded" by this definition
     else:
         # Master is not currently tracked by MediaPipe.
-        MASTER_OCCLUSION_FRAMES += 1
+        MASTER_OCCLUSION_FRAMES += 1 # Continue incrementing, but no reset of last known position here.
         
-        if MASTER_OCCLUSION_FRAMES > MAX_OCCLUSION_FRAMES:
-            # Master lost for too long, reset last known position.
-            if MASTER_LAST_KNOWN_POSITION is not None:
-                print(f"Master lost for {MASTER_OCCLUSION_FRAMES} frames, resetting last known position.")
-            MASTER_LAST_KNOWN_POSITION = None
-            MASTER_OCCLUSION_FRAMES = 0 # Reset frame count for next detection
-            return False # Master is considered fully lost, not just occluded by another nearby person.
-        
-        # If not fully lost, check if another skeleton is nearby, implying potential occlusion.
+        # Check if another skeleton is nearby, implying potential occlusion.
         if MASTER_LAST_KNOWN_POSITION is not None:
             for landmarks, pose_results in current_skeletons_data:
                 current_center = np.mean([[lm.x, lm.y] for lm in landmarks.landmark], axis=0) * np.array([image_width, image_height])
@@ -365,10 +348,10 @@ def detect_occlusion(current_skeletons_data, frame_idx, image_width, image_heigh
                 
                 if distance_to_master < OCCLUSION_DISTANCE_THRESHOLD:
                     # Another skeleton is close to where the master was. This is a potential occlusion.
-                    print(f"Master not seen, but potential occluder detected nearby! Distance: {distance_to_master:.1f}px")
+                    # print(f"Master not seen, but potential occluder detected nearby! Distance: {distance_to_master:.1f}px") # Debug print
                     return True # Indicate potential short-term occlusion by another person
         
-        return False # Master not tracked, no nearby skeleton, and not yet over MAX_OCCLUSION_FRAMES (just momentarily lost or left frame)
+        return False # Master not tracked, no nearby skeleton.
 
 
 def detect_master_disappearance_direction(image_width):
@@ -664,7 +647,13 @@ def main():
                 if master_is_tracked_by_mediapipe_this_frame:
                     master_skel_bbox = tracked_skeletons[MASTER_ID]['bbox']
                     update_master_position_tracking(master_skel_bbox) # Update master's x position
-                    master_disappeared_direction = None # Master is visible, so reset any disappearance flag
+                    
+                    # Announce disappearance direction only if it was just lost and now reappears.
+                    # If master just reappeared, clear disappearance direction.
+                    if previous_master_was_tracked and master_disappeared_direction is not None:
+                        print(f"Master reappeared! Previously disappeared from {master_disappeared_direction}")
+                        announce("Master has reappeared!") # New announcement
+                    master_disappeared_direction = None # Reset any disappearance flag
 
                     # Check for IoU-based occlusion with *other* people while master is visible
                     max_iou_with_other_person = 0.0
@@ -707,111 +696,97 @@ def main():
 
                 # --- Scenario B: Master skeleton is NOT currently tracked by MediaPipe ---
                 else: # Master is lost by MediaPipe
-                    # If master ID was never set or fully lost previously.
-                    if MASTER_ID == -1 or MASTER_LAST_KNOWN_POSITION is None:
-                        cv2.putText(image_bgr, "Master Status: Lost (Not Calibrated)", (10, 60),
+                    # If master ID was never set (e.g., system just started, or master calibration failed)
+                    if MASTER_ID == -1:
+                        cv2.putText(image_bgr, "Master Status: Not Calibrated", (10, 60),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                         master_disappeared_direction = None
-                    else: # Master was previously tracked (MASTER_ID != -1 and MASTER_LAST_KNOWN_POSITION is not None)
-                          # but is now lost by MediaPipe in this frame.
+                    else: # Master was previously tracked (MASTER_ID != -1) but is now lost by MediaPipe in this frame.
+                          # Now it only enters a "searching" state.
 
-                        # Prioritize true disappearance if MASTER_OCCLUSION_FRAMES exceeds threshold.
-                        # This implies a long-term loss, not just a brief occlusion.
-                        if MASTER_OCCLUSION_FRAMES >= MAX_OCCLUSION_FRAMES:
-                            if previous_master_was_tracked and master_disappeared_direction is None: # Only announce direction once after first real loss
-                                direction = detect_master_disappearance_direction(image_width)
-                                if direction:
-                                    print(f"*** 主人骨架从视野{direction}边消失 (长时间丢失) ***")
-                                    if direction == "LEFT":
-                                        announce("Master disappeared from the left side")
-                                    elif direction == "RIGHT":
-                                        announce("Master disappeared from the right side")
-                                    else:
-                                        announce("Master disappeared from the center")
-                                # Consider resetting MASTER_ID here if it's a permanent loss
-                                # MASTER_ID = -1 # uncomment if a true permanent reset is desired
-                            
-                            cv2.putText(image_bgr, "Master Status: Lost (Disappeared)", (10, 60),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                            if master_disappeared_direction:
-                                cv2.putText(image_bgr, f"Disappeared from: {master_disappeared_direction}", (10, 90),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 100), 1)
-                        else:
-                            # Master is temporarily lost (short-term, within MAX_OCCLUSION_FRAMES).
-                            # This is where re-identification attempt makes sense.
-                            cv2.putText(image_bgr, "Master Status: Lost (Searching)", (10, 60),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
-                            if master_disappeared_direction: # If already set from a previous, quick disappearance.
-                                cv2.putText(image_bgr, f"Last Direction: {master_disappeared_direction}", (10, 90),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 100), 1)
-                            
-                            # Re-identification attempt: If master is not currently tracked by MediaPipe,
-                            # and we are not in OCCLUSION_WAIT state (which is for IoU occlusions).
-                            # The `is_master_mediapipe_lost_and_another_skeleton_nearby` (from detect_occlusion)
-                            # is a softer "occlusion" signal, which should *not* prevent face re-id,
-                            # as the face might be momentarily visible for re-id.
-                            if current_state == "STEP3_TRACKING" and MASTER_FACE_ENCODINGS:
-                                face_locations = face_recognition.face_locations(image_rgb)
-                                face_encodings = face_recognition.face_encodings(image_rgb, face_locations)
+                        # Announce disappearance direction only on the FIRST frame it's lost
+                        if previous_master_was_tracked and master_disappeared_direction is None:
+                            direction = detect_master_disappearance_direction(image_width)
+                            if direction:
+                                print(f"*** 主人骨架从视野{direction}边消失 ***")
+                                if direction == "LEFT":
+                                    announce("Master disappeared from the left side")
+                                elif direction == "RIGHT":
+                                    announce("Master disappeared from the right side")
+                                else:
+                                    announce("Master disappeared from the center")
+                        
+                        cv2.putText(image_bgr, f"Master Status: Lost (Searching)", (10, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
+                        cv2.putText(image_bgr, f"Lost for: {MASTER_OCCLUSION_FRAMES} frames", (10, 90),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 165, 0), 1)
+                        if master_disappeared_direction:
+                            cv2.putText(image_bgr, f"Last Direction: {master_disappeared_direction}", (10, 110),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 100), 1)
+                        
+                        # Re-identification attempt: If master is not currently tracked by MediaPipe,
+                        # and we are not in OCCLUSION_WAIT state (which is for explicit IoU occlusions).
+                        # The `is_master_mediapipe_lost_and_another_skeleton_nearby` (from detect_occlusion)
+                        # is a softer "occlusion" signal, which should *not* prevent face re-id.
+                        if current_state == "STEP3_TRACKING" and MASTER_FACE_ENCODINGS:
+                            face_locations = face_recognition.face_locations(image_rgb)
+                            face_encodings = face_recognition.face_encodings(image_rgb, face_locations)
 
-                                if face_encodings:
-                                    best_master_face_idx = -1
-                                    best_master_distance = float('inf')
+                            if face_encodings:
+                                best_master_face_idx = -1
+                                best_master_distance = float('inf')
+                                
+                                for i, face_encoding in enumerate(face_encodings):
+                                    is_master_face, distance = recognize_master_face([face_encoding])
                                     
-                                    for i, face_encoding in enumerate(face_encodings):
-                                        is_master_face, distance = recognize_master_face([face_encoding])
-                                        
-                                        if is_master_face and distance < best_master_distance:
-                                            best_master_distance = distance
-                                            best_master_face_idx = i
-                                    
-                                    if best_master_face_idx != -1:
-                                        top, right, bottom, left = face_locations[best_master_face_idx]
-                                        face_bbox_reid = [left, top, right - left, bottom - top]
-                                        face_center = [left + (right - left) // 2, top + (bottom - top) // 2]
+                                    if is_master_face and distance < best_master_distance:
+                                        best_master_distance = distance
+                                        best_master_face_idx = i
+                                
+                                if best_master_face_idx != -1:
+                                    top, right, bottom, left = face_locations[best_master_face_idx]
+                                    face_bbox_reid = [left, top, right - left, bottom - top]
+                                    face_center = [left + (right - left) // 2, top + (bottom - top) // 2]
 
-                                        best_skeleton_id = -1
-                                        best_skeleton_score = -1
-                                        
-                                        # Find the skeleton that best matches this re-identified master face
-                                        for s_id, s_data in tracked_skeletons.items():
-                                            # We need to make sure this is not the current MASTER_ID if MASTER_ID is just temporarily lost
-                                            # and we are trying to re-associate. Or perhaps if is_master is false for some reason.
-                                            # Let's consider all non-master skeletons for re-association.
-                                            # Or specifically, if current MASTER_ID is lost (is_master_tracked_by_mediapipe_this_frame is false)
-                                            # and this s_id is not already marked as master (s_data['is_master'] is False).
-                                            if not s_data['is_master'] or (s_id == MASTER_ID and not master_is_tracked_by_mediapipe_this_frame):
-                                                skeleton_bbox_reid = s_data['bbox']
-                                                skeleton_center = [skeleton_bbox_reid[0] + skeleton_bbox_reid[2] // 2, 
-                                                                    skeleton_bbox_reid[1] + skeleton_bbox_reid[3] // 2]
-                                                
-                                                iou = calculate_iou(face_bbox_reid, skeleton_bbox_reid)
-                                                center_distance = np.sqrt((face_center[0] - skeleton_center[0])**2 + 
-                                                                            (face_center[1] - skeleton_center[1])**2)
-                                                relative_distance = center_distance / np.sqrt(image_width**2 + image_height**2)
-                                                
-                                                if iou > 0.05:
-                                                    score = iou * 0.7 + (1.0 - relative_distance) * 0.3
-                                                else:
-                                                    score = (1.0 - relative_distance) * 0.5
-                                                
-                                                if score > best_skeleton_score:
-                                                    best_skeleton_score = score
-                                                    best_skeleton_id = s_id
-                                        
-                                        if best_skeleton_id != -1 and best_skeleton_score > 0.1:
-                                            # Re-assign master if a good match is found
-                                            MASTER_ID = best_skeleton_id
-                                            tracked_skeletons[MASTER_ID]['is_master'] = True
-                                            master_bbox = tracked_skeletons[MASTER_ID]['bbox']
-                                            MASTER_LAST_KNOWN_POSITION = [master_bbox[0] + master_bbox[2] // 2, 
-                                                                          master_bbox[1] + master_bbox[3] // 2]
-                                            MASTER_OCCLUSION_FRAMES = 0 # Reset occlusion frames on re-id
-                                            print(f"--- Master {MASTER_ID} re-identification successful! ---")
-                                            print(f"Face match distance: {best_master_distance:.3f}")
-                                            print(f"Skeleton binding score: {best_skeleton_score:.3f}")
-                                            announce("Master re-identified.")
-                                            master_disappeared_direction = None # Reset direction once re-identified
+                                    best_skeleton_id = -1
+                                    best_skeleton_score = -1
+                                    
+                                    # Find the skeleton that best matches this re-identified master face
+                                    for s_id, s_data in tracked_skeletons.items():
+                                        # Only consider skeletons that are not currently the master
+                                        # Or are the master, but are currently "lost" by MediaPipe
+                                        if not s_data['is_master'] or (s_id == MASTER_ID and not master_is_tracked_by_mediapipe_this_frame):
+                                            skeleton_bbox_reid = s_data['bbox']
+                                            skeleton_center = [skeleton_bbox_reid[0] + skeleton_bbox_reid[2] // 2, 
+                                                                skeleton_bbox_reid[1] + skeleton_bbox_reid[3] // 2]
+                                            
+                                            iou = calculate_iou(face_bbox_reid, skeleton_bbox_reid)
+                                            center_distance = np.sqrt((face_center[0] - skeleton_center[0])**2 + 
+                                                                        (face_center[1] - skeleton_center[1])**2)
+                                            relative_distance = center_distance / np.sqrt(image_width**2 + image_height**2)
+                                            
+                                            if iou > 0.05:
+                                                score = iou * 0.7 + (1.0 - relative_distance) * 0.3
+                                            else:
+                                                score = (1.0 - relative_distance) * 0.5
+                                            
+                                            if score > best_skeleton_score:
+                                                best_skeleton_score = score
+                                                best_skeleton_id = s_id
+                                    
+                                    if best_skeleton_id != -1 and best_skeleton_score > 0.1:
+                                        # Re-assign master if a good match is found
+                                        MASTER_ID = best_skeleton_id
+                                        tracked_skeletons[MASTER_ID]['is_master'] = True
+                                        master_bbox = tracked_skeletons[MASTER_ID]['bbox']
+                                        MASTER_LAST_KNOWN_POSITION = [master_bbox[0] + master_bbox[2] // 2, 
+                                                                      master_bbox[1] + master_bbox[3] // 2]
+                                        MASTER_OCCLUSION_FRAMES = 0 # Reset occlusion frames on re-id
+                                        print(f"--- Master {MASTER_ID} re-identification successful! ---")
+                                        print(f"Face match distance: {best_master_distance:.3f}")
+                                        print(f"Skeleton binding score: {best_skeleton_score:.3f}")
+                                        announce("Master re-identified.")
+                                        master_disappeared_direction = None # Reset direction once re-identified
 
 
                 # Draw MediaPipe skeletons
