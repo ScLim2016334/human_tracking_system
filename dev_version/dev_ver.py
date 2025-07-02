@@ -33,6 +33,16 @@ def announce(text):
     tts_thread.daemon = True
     tts_thread.start()
 
+def beep():
+    """Generates a simple beep sound."""
+    # This is a placeholder. For actual sound, you might need a library like 'winsound' on Windows
+    # or 'simpleaudio'/'pydub' for cross-platform. For now, it will just print a message.
+    print("BEEP!")
+    # Example for Windows:
+    # import winsound
+    # winsound.Beep(1000, 200) # Frequency, Duration
+    announce("Beep!") # Announce the beep for demonstration
+
 # --- Global Variables and Configuration Parameters ---
 # Skeleton tracker related (for MediaPipe poses)
 tracked_skeletons = {}  # {skeleton_id: {'last_pose': [landmarks], 'bbox': [x,y,w,h], 'last_seen_frame': frame_idx, 'is_master': False}}
@@ -72,13 +82,17 @@ occlusion_detected = False
 recovery_mode = ""  # "SINGLE_PERSON", "MULTIPLE_PEOPLE", "NO_PEOPLE"
 
 # STEP1 performance optimization variables
-STEP1_FACE_DETECTION_INTERVAL = 3  # Only detect faces every N frames in STEP1
+STEP1_FACE_DETECTION_INTERVAL = 3   # Only detect faces every N frames in STEP1
 step1_last_face_detection_frame = 0
 step1_cached_face_data = {'locations': [], 'encodings': []}
+STEP1_CAPTURE_INTERVAL = 5 # Seconds between face captures
+STEP1_LAST_CAPTURE_TIME = 0
+STEP1_CAPTURE_COUNT = 0
+STEP1_TOTAL_CAPTURES = 3 # Left, Front, Right
 
 # STEP3 master direction detection variables
-master_last_center_x = None  # Track master's last horizontal position
-master_disappeared_direction = None  # "LEFT", "RIGHT", or None
+master_last_center_x = None   # Track master's last horizontal position
+master_disappeared_direction = None   # "LEFT", "RIGHT", or None
 
 # --- Helper Functions ---
 
@@ -223,10 +237,10 @@ def is_hands_on_hips(landmarks):
     wrist_hip_x_threshold_rel = 0.05 
 
     left_hand_on_hip = abs(left_wrist.y - left_hip.y) < wrist_hip_y_threshold_rel and \
-                       abs(left_wrist.x - left_hip.x) < wrist_hip_x_threshold_rel
+                        abs(left_wrist.x - left_hip.x) < wrist_hip_x_threshold_rel
 
     right_hand_on_hip = abs(right_wrist.y - right_hip.y) < wrist_hip_y_threshold_rel and \
-                        abs(right_wrist.x - right_hip.x) < wrist_hip_x_threshold_rel
+                         abs(right_wrist.x - right_hip.x) < wrist_hip_x_threshold_rel
 
     def calculate_angle(a, b, c):
         a_coords = np.array([a.x, a.y])
@@ -310,7 +324,7 @@ def detect_occlusion(current_skeletons_data, frame_idx, image_width, image_heigh
         if s_id == MASTER_ID and s_data['is_master']:
             master_currently_tracked = True
             master_current_position = [s_data['bbox'][0] + s_data['bbox'][2] // 2, 
-                                     s_data['bbox'][1] + s_data['bbox'][3] // 2]
+                                        s_data['bbox'][1] + s_data['bbox'][3] // 2]
             break
     
     if master_currently_tracked:
@@ -373,6 +387,7 @@ def main():
     global MASTER_FACE_RECORDED, MASTER_SKELETON_RECORDED, MASTER_LAST_KNOWN_POSITION, MASTER_OCCLUSION_FRAMES
     global current_state, OCCLUSION_START_TIME, WAIT_START_TIME, occlusion_detected, recovery_mode
     global master_last_center_x, master_disappeared_direction
+    global STEP1_LAST_CAPTURE_TIME, STEP1_CAPTURE_COUNT, STEP1_TOTAL_CAPTURES
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -391,10 +406,11 @@ def main():
 
     print("\n--- Human Following Algorithm with Enhanced IoU-based Occlusion Detection ---")
     announce("Starting human following system.")
-    print("=== STEP 1: Record Master Face (Close to camera) ===")
-    print("1. Move close to camera and press 's' multiple times to record your face from different angles.")
-    print("2. Press 'r' to reset face records if needed.")
-    print("3. Press 'n' to proceed to next step when face recording is complete.")
+    print("=== STEP 1: Record Master Face ===")
+    announce("I will now capture your face. Please look to your left. Then straight. Then to your right. I will beep before each capture.")
+    print("1. Please look to your left, then straight, then to your right when prompted by the system.")
+    print("2. Listen for the beep before each capture.")
+    print("3. Press 'r' to reset face records if needed.")
 
     # YOLO model will be loaded only when needed in Step 3
     yolo_model = None
@@ -437,10 +453,10 @@ def main():
 
             # Different logic based on current state
             if current_state == "STEP1_FACE_RECORDING":
-                # STEP 1: Record master face (close to camera) - Optimized for performance
+                # STEP 1: Record master face (close to camera) - Optimized and Automated
                 global step1_last_face_detection_frame, step1_cached_face_data
                 
-                # Only perform face detection every STEP1_FACE_DETECTION_INTERVAL frames to reduce latency
+                # Only perform face detection every STEP1_FACE_DETECTION_INTERVAL frames
                 if frame_count - step1_last_face_detection_frame >= STEP1_FACE_DETECTION_INTERVAL:
                     face_locations = face_recognition.face_locations(image_rgb)
                     face_encodings = face_recognition.face_encodings(image_rgb, face_locations)
@@ -449,28 +465,77 @@ def main():
                         'encodings': face_encodings
                     }
                     step1_last_face_detection_frame = frame_count
-                else:
-                    # Use cached face detection results
-                    face_locations = step1_cached_face_data['locations']
-                    face_encodings = step1_cached_face_data['encodings']
+                # Else, use cached face detection results
+
+                # Automatic capture logic
+                current_time = time.time()
+                if STEP1_CAPTURE_COUNT < STEP1_TOTAL_CAPTURES:
+                    if current_time - STEP1_LAST_CAPTURE_TIME >= STEP1_CAPTURE_INTERVAL:
+                        beep()
+                        face_encodings_to_record = step1_cached_face_data['encodings']
+                        
+                        total_recorded_this_shot = 0
+                        for face_encoding in face_encodings_to_record:
+                            MASTER_FACE_ENCODINGS.append(face_encoding)
+                            total_recorded_this_shot += 1
+                            print(f"--- Recorded {len(MASTER_FACE_ENCODINGS)}th master face information ---")
+                        
+                        if total_recorded_this_shot > 0:
+                            STEP1_CAPTURE_COUNT += 1
+                            print(f"Captured {total_recorded_this_shot} face(s) for shot {STEP1_CAPTURE_COUNT}/{STEP1_TOTAL_CAPTURES}")
+                            if STEP1_CAPTURE_COUNT == 1:
+                                announce("Please turn your head to face forward.")
+                            elif STEP1_CAPTURE_COUNT == 2:
+                                announce("Please turn your head to face your right.")
+                            elif STEP1_CAPTURE_COUNT == 3:
+                                announce("All face captures complete.")
+                        else:
+                            print("No face detected for current capture. Please ensure you are facing the camera.")
+                            announce("No face detected. Please try again.")
+
+                        STEP1_LAST_CAPTURE_TIME = current_time
                 
-                cv2.putText(image_bgr, "STEP 1: Record Master Face (Close to camera)", (10, 30),
+                if STEP1_CAPTURE_COUNT >= STEP1_TOTAL_CAPTURES and not MASTER_FACE_RECORDED:
+                    if len(MASTER_FACE_ENCODINGS) > 0:
+                        current_state = "STEP2_SKELETON_RECORDING"
+                        MASTER_FACE_RECORDED = True
+                        print(f"\n=== Proceeding to Step 2: Skeleton Recording ===")
+                        print(f"Face recording complete! {len(MASTER_FACE_ENCODINGS)} faces recorded.")
+                        print("Now move away from camera and make yourself visible.")
+                        announce("Face recording complete. Now move away and make yourself visible to be selected as master.")
+                    else:
+                        print("No faces were successfully recorded. Please reset and try again.")
+                        announce("No faces were recorded. Please reset the system to try again.")
+                        # Optionally, go back to a waiting state or reset state
+                        STEP1_CAPTURE_COUNT = 0 # Allow retrying if no faces were recorded
+
+                cv2.putText(image_bgr, "STEP 1: Record Master Face", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
                 cv2.putText(image_bgr, f"Recorded faces: {len(MASTER_FACE_ENCODINGS)}", (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 1, cv2.LINE_AA)
-                cv2.putText(image_bgr, f"Face Tolerance: {FACE_RECOGNITION_TOLERANCE}", (10, 90),
+                cv2.putText(image_bgr, f"Captures remaining: {STEP1_TOTAL_CAPTURES - STEP1_CAPTURE_COUNT}", (10, 90),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 1, cv2.LINE_AA)
-                cv2.putText(image_bgr, "Press 's' to record face, 'n' to proceed", (10, 120),
+                cv2.putText(image_bgr, f"Next capture in: {max(0, STEP1_CAPTURE_INTERVAL - (current_time - STEP1_LAST_CAPTURE_TIME)):.1f}s", (10, 120),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
-                cv2.putText(image_bgr, f"Optimized Mode (Every {STEP1_FACE_DETECTION_INTERVAL} frames)", (10, 150),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
                 
-                for (top, right, bottom, left) in face_locations:
+                # Display current instruction for face capture
+                if STEP1_CAPTURE_COUNT == 0:
+                    instruction_text = "Look Left for next capture"
+                elif STEP1_CAPTURE_COUNT == 1:
+                    instruction_text = "Look Forward for next capture"
+                elif STEP1_CAPTURE_COUNT == 2:
+                    instruction_text = "Look Right for next capture"
+                else:
+                    instruction_text = "Captures complete. Moving to next step soon."
+                cv2.putText(image_bgr, instruction_text, (10, 150),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 0), 2, cv2.LINE_AA)
+                
+                # Draw detected faces
+                for (top, right, bottom, left) in step1_cached_face_data['locations']:
                     cv2.rectangle(image_bgr, (left, top), (right, bottom), (0, 255, 0), 2)
-                    cv2.putText(image_bgr, "Found Face (Press 's')", (left, top - 10),
+                    cv2.putText(image_bgr, "Detected Face", (left, top - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
                 
-                # Only process skeletons if needed (reduce unnecessary computation in STEP1)
                 if tracked_skeletons:
                     for s_id, s_data in tracked_skeletons.items():
                         color = (128, 128, 128)
@@ -485,64 +550,71 @@ def main():
                         cv2.putText(image_bgr, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
             elif current_state == "STEP2_SKELETON_RECORDING":
-                # STEP 2: Record master skeleton - EXACT same as human_tracking.py
+                # STEP 2: Record master skeleton - Automatically identify closest skeleton
                 if not step2_introduced:
-                    print("\n=== STEP 2: Record Master Skeleton (Move away from camera) ===")
-                    print("1. Move away from camera so your full body is visible.")
-                    print("2. Make 'hands on hips' gesture to calibrate as master.")
+                    print("\n=== STEP 2: Select Master Skeleton (Automatic) ===")
+                    print("1. Ensure only the person to be tracked is clearly visible in the camera.")
+                    print("2. The system will automatically select the closest skeleton as the master.")
                     step2_introduced = True
                 
-                cv2.putText(image_bgr, "STEP 2: Record Master Skeleton (Full body visible)", (10, 30),
+                cv2.putText(image_bgr, "STEP 2: Selecting Master Skeleton (Closest Person)", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
                 cv2.putText(image_bgr, f"Recorded faces: {len(MASTER_FACE_ENCODINGS)}", (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 1, cv2.LINE_AA)
-                cv2.putText(image_bgr, "Make 'hands on hips' gesture", (10, 90),
+                cv2.putText(image_bgr, "Ensure only master is visible.", (10, 90),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 1, cv2.LINE_AA)
                 
-                for s_id, s_data in tracked_skeletons.items():
-                    if s_data['last_seen_frame'] == frame_count:
-                        landmarks_for_action = s_data['last_pose'].pose_landmarks
-                        if is_hands_on_hips(landmarks_for_action):
-                            MASTER_POSE_BUFFER.append(True)
-                        else:
-                            MASTER_POSE_BUFFER.append(False)
-                        
-                        if len(MASTER_POSE_BUFFER) > MASTER_HISTORY_THRESHOLD:
-                            MASTER_POSE_BUFFER.pop(0)
-                        
-                        if sum(MASTER_POSE_BUFFER) == MASTER_HISTORY_THRESHOLD:
-                            face_locations = face_recognition.face_locations(image_rgb)
-                            face_encodings = face_recognition.face_encodings(image_rgb, face_locations)
+                if current_skeletons_in_frame_data:
+                    # Find the closest skeleton based on the Y-coordinate (lower Y is usually closer to bottom of frame)
+                    # Or, more robustly, based on bbox area (larger bbox usually means closer)
+                    # For simplicity, let's use bbox area here, assuming larger means closer
+                    
+                    closest_skeleton_id = -1
+                    max_bbox_area = 0
+
+                    for s_id, s_data in tracked_skeletons.items():
+                        if s_data['last_seen_frame'] == frame_count: # Only consider currently detected skeletons
+                            bbox = s_data['bbox']
+                            bbox_area = bbox[2] * bbox[3] # width * height
                             
-                            if face_encodings:
-                                is_master_face, best_distance = recognize_master_face(face_encodings)
-                                
-                                if is_master_face:
-                                    MASTER_ID = s_id
-                                    tracked_skeletons[MASTER_ID]['is_master'] = True
-                                    MASTER_SKELETON_RECORDED = True
-                                    master_bbox = tracked_skeletons[MASTER_ID]['bbox']
-                                    MASTER_LAST_KNOWN_POSITION = [master_bbox[0] + master_bbox[2] // 2, 
-                                                                master_bbox[1] + master_bbox[3] // 2]
-                                    current_state = "STEP3_TRACKING"
-                                    announce("Master skeleton calibrated! Starting enhanced tracking mode.")
-                                    print(f"--- Master skeleton {MASTER_ID} calibrated through hands-on-hips action and face recognition! ---")
-                                    print(f"Face match distance: {best_distance:.3f}")
-                                    MASTER_POSE_BUFFER = []
-                                    break
-                                else:
-                                    print("Warning: Hands-on-hips action detected but face doesn't match recorded master faces.")
-                                    print(f"Best face distance: {best_distance:.3f} (threshold: {FACE_RECOGNITION_TOLERANCE})")
-                                    MASTER_POSE_BUFFER = []
-                            else:
-                                print("Warning: Hands-on-hips action detected but no face found in the image.")
-                                MASTER_POSE_BUFFER = []
-                
+                            if bbox_area > max_bbox_area:
+                                max_bbox_area = bbox_area
+                                closest_skeleton_id = s_id
+
+                    if closest_skeleton_id != -1:
+                        if not MASTER_SKELETON_RECORDED:
+                            MASTER_ID = closest_skeleton_id
+                            tracked_skeletons[MASTER_ID]['is_master'] = True
+                            MASTER_SKELETON_RECORDED = True
+                            
+                            master_bbox = tracked_skeletons[MASTER_ID]['bbox']
+                            MASTER_LAST_KNOWN_POSITION = [master_bbox[0] + master_bbox[2] // 2, 
+                                                          master_bbox[1] + master_bbox[3] // 2]
+                            
+                            current_state = "STEP3_TRACKING"
+                            announce("Master skeleton selected! Starting enhanced tracking mode.")
+                            print(f"--- Master skeleton {MASTER_ID} automatically selected! ---")
+                        else:
+                            # If master was already recorded, but we are still in STEP2 for some reason,
+                            # ensure the master flag is correct or transition to STEP3.
+                            # This block might not be strictly needed if state transition is perfect,
+                            # but acts as a safeguard.
+                            if MASTER_ID not in tracked_skeletons or not tracked_skeletons[MASTER_ID]['is_master']:
+                                MASTER_ID = closest_skeleton_id
+                                tracked_skeletons[MASTER_ID]['is_master'] = True
+                                master_bbox = tracked_skeletons[MASTER_ID]['bbox']
+                                MASTER_LAST_KNOWN_POSITION = [master_bbox[0] + master_bbox[2] // 2, 
+                                                              master_bbox[1] + master_bbox[3] // 2]
+                                announce("Master re-selected. Resuming tracking.")
+                                print(f"--- Master skeleton re-selected to {MASTER_ID} ---")
+                            current_state = "STEP3_TRACKING" # Ensure transition to tracking
+
+
                 for s_id, s_data in tracked_skeletons.items():
                     color = (0, 255, 0)
                     label = f"ID: {s_id}"
                     
-                    if s_data['is_master']:
+                    if s_id == MASTER_ID and s_data['is_master']: # Use MASTER_ID to check for master
                         color = (0, 0, 255)
                         label = f"Master ID: {s_id}"
                     
@@ -564,7 +636,7 @@ def main():
                     except Exception as e:
                         print(f"Error loading YOLO model: {e}")
                         announce("Error: Could not load object detection model.")
-                        current_state = "STEP2_SKELETON_RECORDING"
+                        current_state = "STEP2_SKELETON_RECORDING" # Fallback
                         continue
 
                 cv2.putText(image_bgr, "STEP 3: Enhanced Tracking (MediaPipe + YOLO)", (10, 30),
@@ -684,11 +756,11 @@ def main():
                                 if not s_data['is_master']:
                                     skeleton_bbox_reid = s_data['bbox']
                                     skeleton_center = [skeleton_bbox_reid[0] + skeleton_bbox_reid[2] // 2, 
-                                                      skeleton_bbox_reid[1] + skeleton_bbox_reid[3] // 2]
+                                                                    skeleton_bbox_reid[1] + skeleton_bbox_reid[3] // 2]
                                     
                                     iou = calculate_iou(face_bbox_reid, skeleton_bbox_reid)
                                     center_distance = np.sqrt((face_center[0] - skeleton_center[0])**2 + 
-                                                            (face_center[1] - skeleton_center[1])**2)
+                                                                (face_center[1] - skeleton_center[1])**2)
                                     relative_distance = center_distance / np.sqrt(image_width**2 + image_height**2)
                                     
                                     if iou > 0.05:
@@ -705,7 +777,7 @@ def main():
                                 tracked_skeletons[MASTER_ID]['is_master'] = True
                                 master_bbox = tracked_skeletons[MASTER_ID]['bbox']
                                 MASTER_LAST_KNOWN_POSITION = [master_bbox[0] + master_bbox[2] // 2, 
-                                                            master_bbox[1] + master_bbox[3] // 2]
+                                                              master_bbox[1] + master_bbox[3] // 2]
                                 print(f"--- Master {MASTER_ID} re-identification successful! ---")
                                 print(f"Face match distance: {best_master_distance:.3f}")
                                 print(f"Skeleton binding score: {best_skeleton_score:.3f}")
@@ -767,38 +839,9 @@ def main():
 
             cv2.imshow('Human Following Algorithm', image_bgr)
 
-            # Handle key presses - Optimized for STEP1 performance
+            # Handle key presses
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('s') and current_state == "STEP1_FACE_RECORDING":
-                # Use cached face detection results to avoid recomputation
-                face_encodings_to_record = step1_cached_face_data['encodings']
-                
-                total_recorded = 0
-                for face_encoding in face_encodings_to_record:
-                    MASTER_FACE_ENCODINGS.append(face_encoding)
-                    total_recorded += 1
-                    print(f"--- Recorded {len(MASTER_FACE_ENCODINGS)}th master face information ---")
-                
-                if total_recorded > 0:
-                    print(f"Currently recorded {len(MASTER_FACE_ENCODINGS)} face information")
-                    announce(f"Recorded {total_recorded} face samples.")
-                else:
-                    print("No face detected in cached data, cannot record face information. Please ensure you are facing the camera.")
-                    announce("No face detected. Please face the camera.")
-
-            elif key == ord('n') and current_state == "STEP1_FACE_RECORDING":
-                if len(MASTER_FACE_ENCODINGS) > 0:
-                    current_state = "STEP2_SKELETON_RECORDING"
-                    MASTER_FACE_RECORDED = True
-                    print(f"\n=== Proceeding to Step 2: Skeleton Recording ===")
-                    print(f"Face recording complete! {len(MASTER_FACE_ENCODINGS)} faces recorded.")
-                    print("Now move away from camera and make 'hands on hips' gesture.")
-                    announce("Face recording complete. Now move away and make 'hands on hips' gesture.")
-                else:
-                    print("Please record at least one face first.")
-                    announce("Please record your face first.")
-
-            elif key == ord('r'):
+            if key == ord('r'):
                 # Reset everything including STEP1 optimization variables
                 MASTER_FACE_ENCODINGS = []
                 MASTER_ID = -1
@@ -818,12 +861,15 @@ def main():
                 # Reset STEP1 optimization variables
                 step1_last_face_detection_frame = 0
                 step1_cached_face_data = {'locations': [], 'encodings': []}
+                STEP1_LAST_CAPTURE_TIME = 0
+                STEP1_CAPTURE_COUNT = 0
                 # Reset STEP3 direction detection variables
                 master_last_center_x = None
                 master_disappeared_direction = None
                 print("--- All recorded information and master status has been reset ---")
                 print("=== Back to Step 1: Face Recording ===")
                 announce("System reset. Please record your face again.")
+                announce("I will now capture your face. Please look to your left. Then straight. Then to your right. I will beep before each capture.")
 
             elif key == ord('q'):
                 break
